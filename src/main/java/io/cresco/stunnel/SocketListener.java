@@ -49,7 +49,6 @@ public class SocketListener implements Runnable  {
         clientThreads = Collections.synchronizedMap(new HashMap<>());
         clientStatusLock = new AtomicBoolean();
         clientStatus = Collections.synchronizedMap(new HashMap<>());
-
     }
 
     public void close() {
@@ -68,8 +67,7 @@ public class SocketListener implements Runnable  {
         isActive = true;
 
         try {
-            logger.info("Plugin " + plugin.getPluginID() + "stunnel_id:" + sTunnelId + " listening on port " + srcPort);
-
+            //logger.info("Plugin " + plugin.getPluginID() + "stunnel_id:" + sTunnelId + " listening on port " + srcPort);
             serverSocket = new ServerSocket(srcPort);
             socketController.setTunnelStatus(sTunnelId, SocketController.StatusType.ACTIVE);
 
@@ -77,10 +75,11 @@ public class SocketListener implements Runnable  {
 
                 try {
 
+                    logger.error("(4): port open and waiting for incoming request on port: " + srcPort);
                     Socket clientSocket = serverSocket.accept();
 
                     String clientId = UUID.randomUUID().toString();
-                    logger.error("SOCKET CONNECTED!");
+                    //logger.error("SOCKET CONNECTED!");
 
                     //set thread, arrange comm with remote host
                     setClientThreads(this, clientId, clientSocket);
@@ -88,14 +87,16 @@ public class SocketListener implements Runnable  {
                     new Thread(getClientThreads(clientId)).start();
 
 
+
                 }  catch (java.net.SocketException sx) {
                     if(!sx.getMessage().equals("Socket closed")) {
-                        logger.info("SocketException: " + sx.getMessage());
+                        logger.error("Socket error: " + srcPort + " error: " + sx.getMessage());
                     }
 
 
                 } catch(Exception ex) {
                     ex.printStackTrace();
+                    logger.error("problem when accepting: " + srcPort + " error: " + ex.getMessage());
                 }
 
             }
@@ -185,6 +186,7 @@ public class SocketListener implements Runnable  {
             mClientSocket = aClientSocket;
             this.clientId = clientId;
             gson = new Gson();
+            logger.error("(5): started Client Thread with client_id" + clientId);
         }
 
         public void close() {
@@ -216,7 +218,7 @@ public class SocketListener implements Runnable  {
 
             try {
 
-                logger.info("Plugin " + plugin.getPluginID() + " creating client socket streams.");
+                //logger.info("Plugin " + plugin.getPluginID() + " creating client socket streams.");
 
                 // Turn on keep-alive for both the sockets
                 mClientSocket.setKeepAlive(true);
@@ -231,6 +233,8 @@ public class SocketListener implements Runnable  {
                 clientForward = new ForwardThread(this, clientIn, clientOut, clientId);
                 //send message to remote to bring up port and list
 
+                logger.error("(7): sending message to remote host to get ready for incoming data");
+
                 Map<String,String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
                 //set client_id
                 tunnelConfig.put("client_id",clientId);
@@ -239,10 +243,11 @@ public class SocketListener implements Runnable  {
                 request.setParam("action", "configdsttunnel");
                 request.setParam("action_tunnel_config", gson.toJson(tunnelConfig));
                 MsgEvent response = plugin.sendRPC(request);
-                System.out.println(response.getParams());
+                //System.out.println(response.getParams());
                 //lets assume all is good and start my side
 
                 clientForward.start();
+                logger.error("(12): clientForward started");
 
             } catch (Exception ex) {
                 ex.printStackTrace();
@@ -295,7 +300,7 @@ public class SocketListener implements Runnable  {
          */
         String clientId;
         public ForwardThread(ClientThread aParent, InputStream aInputStream, OutputStream aOutputStream, String clientId) throws JMSException {
-            logger.info("Plugin " + plugin.getPluginID() + " creating forwarding thread.");
+            //logger.info("Plugin " + plugin.getPluginID() + " creating forwarding thread.");
             mParent = aParent;
             mInputStream = aInputStream;
             mOutputStream = aOutputStream;
@@ -310,9 +315,10 @@ public class SocketListener implements Runnable  {
                         byte[] buffer = new byte[BUFFER_SIZE];
 
                         if (msg instanceof BytesMessage) {
-                            logger.info("WE GOT SOMETHING BYTES L");
+                            //logger.info("WE GOT SOMETHING BYTES L");
                             int bytesRead = ((BytesMessage) msg).readBytes(buffer);
-                            logger.info("Message In: " + new String(buffer));
+                            //logger.info("Message In: " + new String(buffer));
+                            logger.error("Message In: " + bytesRead);
                             mOutputStream.write(buffer, 0, bytesRead);
                             mOutputStream.flush();
                         }
@@ -327,6 +333,8 @@ public class SocketListener implements Runnable  {
 
             String queryString = "stunnel_id='" + sTunnelId + "' and client_id='" + clientId + "' and direction='src'";
             node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.AGENT,ml,queryString);
+
+            logger.error("(6): src listner:" + node_from_listner_id + " started");
 
             forwardingActive = true;
 
@@ -355,14 +363,16 @@ public class SocketListener implements Runnable  {
                     int bytesRead = mInputStream.read(buffer);
                     if (bytesRead == -1)
                         break; // End of stream is reached --> exit
-
-                    BytesMessage bytesMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
-                    bytesMessage.setStringProperty("stunnel_id",sTunnelId);
-                    bytesMessage.setStringProperty("direction","dst");
-                    bytesMessage.setStringProperty("client_id",clientId);
-                    bytesMessage.writeBytes(buffer);
-                    plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,bytesMessage);
-                    logger.info("Plugin " + plugin.getPluginID() + " writing " + buffer.length + " bytes to stunnel_name:" + sTunnelId);
+                    if(bytesRead > 0) {
+                        logger.error("bytesRead: " + bytesRead);
+                        BytesMessage bytesMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
+                        bytesMessage.setStringProperty("stunnel_id", sTunnelId);
+                        bytesMessage.setStringProperty("direction", "dst");
+                        bytesMessage.setStringProperty("client_id", clientId);
+                        bytesMessage.writeBytes(buffer, 0, bytesRead);
+                        plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT, bytesMessage);
+                        logger.debug("Plugin " + plugin.getPluginID() + " writing " + buffer.length + " bytes to stunnel_name:" + sTunnelId);
+                    }
                     //mOutputStream.write(buffer, 0, bytesRead);
                     //mOutputStream.flush();
                 }

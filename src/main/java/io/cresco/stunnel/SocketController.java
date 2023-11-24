@@ -71,6 +71,7 @@ public class SocketController  {
             tunnelConfig.put("src_agent", plugin.getAgent());
             tunnelConfig.put("src_plugin", plugin.getPluginID());
 
+            logger.error("(2): send message to remote plugin and check if dst host/port is listening");
             //send message to remote plugin and check if dst host/port is listening
             MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, dstRegion, dstAgent, dstPlugin);
             request.setParam("action", "dstportcheck");
@@ -92,23 +93,24 @@ public class SocketController  {
                 //set the tunnel config
                 setTunnelConfig(sTunnelId, tunnelConfig);
 
+                logger.error("(3): remote port is listening, start SocketListener()");
                 //create listener
                 socketListener = new SocketListener(plugin, this, sTunnelId, srcPort);
                 //start new listner thread
-                logger.error("STARTING THREAD FOR LISTENER");
+                //logger.error("STARTING THREAD FOR LISTENER");
                 new Thread(socketListener).start();
 
 
             } else {
                 //tear down things broke
-                logger.info("Failed to create tunnel error: Remote dstTunnel config failed.");
+                logger.error("Failed to create tunnel error: Remote dstTunnel config failed.");
             }
 
             //start port listener here
             //on first
 
         } catch (Exception ex) {
-            logger.info("Failed to create tunnel error: " + ex.getMessage());
+            logger.error("Failed to create tunnel error: " + ex.getMessage());
             ex.printStackTrace();
         }
 
@@ -156,7 +158,7 @@ public class SocketController  {
 
             //String sTunnelId = tunnelConfig.get("stunnel_id");
 
-            logger.info("createDstTunnel NEW MAP: " + tunnelConfig);
+            //logger.info("createDstTunnel NEW MAP: " + tunnelConfig);
 
             SocketSender socketSender = new SocketSender(plugin, this, tunnelConfig);
             socketSender.go();

@@ -108,7 +108,7 @@ public class ExecutorImpl implements Executor {
 
     private MsgEvent createSrcTunnel(MsgEvent incoming) {
 
-        logger.info("createSrcTunnel INCOMING: " + incoming.getParams());
+        logger.debug("createSrcTunnel INCOMING: " + incoming.getParams());
         try {
 
             if ((incoming.getParam("action_src_port") != null) && (incoming.getParam("action_dst_host") != null) &&
@@ -123,6 +123,7 @@ public class ExecutorImpl implements Executor {
                 String dstPlugin = incoming.getParam("action_dst_plugin");
 
                 if(isSrcPortFree(srcPort)) {
+                    logger.error("(1): local port is free");
                     if(socketController.createSrcTunnel(srcPort, dstHost, dstPort, dstRegion, dstAgent, dstPlugin)) {
                         incoming.setParam("status", "10");
                         incoming.setParam("status_desc", "tunnel created");
@@ -149,7 +150,7 @@ public class ExecutorImpl implements Executor {
 
     private MsgEvent createDstTunnel(MsgEvent incoming) {
 
-        logger.info("createDstTunnel INCOMING: " + incoming.getParams());
+        //logger.info("createDstTunnel INCOMING: " + incoming.getParams());
         try {
 
             if (incoming.getParam("action_tunnel_config") != null) {
@@ -180,7 +181,7 @@ public class ExecutorImpl implements Executor {
 
     private MsgEvent dstPortCheck(MsgEvent incoming) {
 
-        logger.info("dstPortCheck INCOMING: " + incoming.getParams());
+        //logger.info("dstPortCheck INCOMING: " + incoming.getParams());
         try {
 
             if ((incoming.getParam("action_dst_host") != null) && (incoming.getParam("action_dst_port") != null)) {
@@ -271,7 +272,7 @@ public class ExecutorImpl implements Executor {
             if (s != null) {
                 if ( s.isConnected()) {
                     isListening = true;
-                    logger.error("Port " + port + " on " + node + " is reachable!");
+                    logger.debug("Port " + port + " on " + node + " is reachable!");
                 } else {
                     logger.error("Port " + port + " on " + node + " is not reachable; reason: " + reason );
                 }

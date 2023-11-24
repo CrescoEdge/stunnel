@@ -40,6 +40,7 @@ public class SocketSender  {
 
         ClientThread clientThread = new ClientThread(remoteHost, remotePort);
         clientThread.start();
+        logger.error("(8): [dst] ClientThread started");
 
     }
 
@@ -67,6 +68,7 @@ public class SocketSender  {
             OutputStream serverOut;
 
             try {
+                logger.error("(9): [dst] connecting to dst port");
                 // Connect to the destination server
                 mServerSocket = new Socket(remoteHost, remotePort);
 
@@ -78,12 +80,16 @@ public class SocketSender  {
                 serverIn = mServerSocket.getInputStream();
                 serverOut = mServerSocket.getOutputStream();
 
+
                 ForwardThread clientForward = new ForwardThread(this, serverIn, serverOut);
                 clientForward.start();
+                logger.error("(11): [dst] ForwardThread started");
+
 
 
             } catch (IOException | JMSException ioe) {
-                System.err.println("Can not connect to " + remoteHost + " " + remotePort);
+                logger.error("Can not connect to " + remoteHost + " " + remotePort);
+                //System.err.println("Can not connect to " + remoteHost + " " + remotePort);
                         //TCPForwardServer.DESTINATION_HOST + ":" +
                         //TCPForwardServer.DESTINATION_PORT);
                 //connectionBroken();
@@ -109,7 +115,7 @@ public class SocketSender  {
          * its parent, input stream and output stream.
          */
         public ForwardThread(ClientThread aParent, InputStream aInputStream, OutputStream aOutputStream) throws JMSException {
-            logger.info("Plugin " + plugin.getPluginID() + " creating forwarding thread.");
+            logger.debug("Plugin " + plugin.getPluginID() + " creating forwarding thread.");
             mParent = aParent;
             mInputStream = aInputStream;
             mOutputStream = aOutputStream;
@@ -125,7 +131,8 @@ public class SocketSender  {
 
                         if (msg instanceof BytesMessage) {
                             int bytesRead = ((BytesMessage) msg).readBytes(buffer);
-                            logger.info("Message In: " + new String(buffer));
+                            //logger.info("Message In: " + new String(buffer));
+                            logger.error("Message In: " + bytesRead);
                             mOutputStream.write(buffer, 0, bytesRead);
                             mOutputStream.flush();
                         }
@@ -139,6 +146,7 @@ public class SocketSender  {
 
             String queryString = "stunnel_id='" + sTunnelId + "' and client_id='" + clientId + "' and direction='dst'";
             node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.AGENT,ml,queryString);
+            logger.error("(10): [dst] listner: " + node_from_listner_id + " started");
         }
 
         /**
@@ -155,15 +163,16 @@ public class SocketSender  {
                     if (bytesRead == -1)
                         break; // End of stream is reached --> exit
 
-                    BytesMessage bytesMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
-                    bytesMessage.setStringProperty("stunnel_id",sTunnelId);
-                    bytesMessage.setStringProperty("direction","src");
-                    bytesMessage.setStringProperty("client_id",clientId);
+                    if(bytesRead > 0) {
+                        BytesMessage bytesMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
+                        bytesMessage.setStringProperty("stunnel_id", sTunnelId);
+                        bytesMessage.setStringProperty("direction", "src");
+                        bytesMessage.setStringProperty("client_id", clientId);
+                        bytesMessage.writeBytes(buffer, 0, bytesRead);
+                        plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT, bytesMessage);
 
-                    bytesMessage.writeBytes(buffer);
-                    plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,bytesMessage);
-
-                    logger.info("Plugin " + plugin.getPluginID() + " writing " + buffer.length + " bytes to stunnel_name:" + sTunnelId);
+                        logger.debug("Plugin " + plugin.getPluginID() + " writing " + buffer.length + " bytes to stunnel_name:" + sTunnelId);
+                    }
                     //mOutputStream.write(buffer, 0, bytesRead);
                     //mOutputStream.flush();
                 }
