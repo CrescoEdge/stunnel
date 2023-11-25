@@ -27,7 +27,6 @@ public class ExecutorImpl implements Executor {
     private PluginBuilder plugin;
     private CLogger logger;
     private Gson gson;
-    private Type listType;
 
 
     private SocketController socketController;
@@ -37,7 +36,6 @@ public class ExecutorImpl implements Executor {
         logger = plugin.getLogger(ExecutorImpl.class.getName(), CLogger.Level.Info);
         this.socketController = socketController;
         gson = new Gson();
-        listType = new TypeToken<ArrayList<String>>(){}.getType();
 
     }
 
@@ -116,10 +114,16 @@ public class ExecutorImpl implements Executor {
                 String dstRegion = incoming.getParam("action_dst_region");
                 String dstAgent = incoming.getParam("action_dst_agent");
                 String dstPlugin = incoming.getParam("action_dst_plugin");
+                int bufferSize = 8192;
+                if(incoming.getParam("action_dst_agent") != null) {
+                    bufferSize = Integer.parseInt(incoming.getParam("action_buffer_size"));
+                    logger.error("custom buffer_size: " + bufferSize);
+                }
+
 
                 if(isSrcPortFree(srcPort)) {
                     logger.error("(1): local port is free");
-                    if(socketController.createSrcTunnel(srcPort, dstHost, dstPort, dstRegion, dstAgent, dstPlugin)) {
+                    if(socketController.createSrcTunnel(srcPort, dstHost, dstPort, dstRegion, dstAgent, dstPlugin, bufferSize)) {
                         incoming.setParam("status", "10");
                         incoming.setParam("status_desc", "tunnel created");
                     } else {

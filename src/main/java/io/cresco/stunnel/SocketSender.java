@@ -35,6 +35,8 @@ public class SocketSender  {
 
     public SocketController socketController;
 
+    public int bufferSize = 8192;
+
     public SocketSender(PluginBuilder plugin, SocketController socketController, Map<String,String> tunnelConfig)  {
         this.plugin = plugin;
         logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
@@ -45,6 +47,12 @@ public class SocketSender  {
         this.remotePort = Integer.parseInt(tunnelConfig.get("dst_port"));
         clientThreadsLock = new AtomicBoolean();
         clientThreads = Collections.synchronizedMap(new HashMap<>());
+
+        if(tunnelConfig.containsKey("buffer_size")) {
+            bufferSize = Integer.parseInt(tunnelConfig.get("buffer_size"));
+            logger.error("custom buffer_size: " + bufferSize);
+        }
+
     }
 
     public boolean start() {
@@ -124,7 +132,7 @@ public class SocketSender  {
     }
 
     class ClientThread extends Thread {
-        private int BUFFER_SIZE;
+        //private int BUFFER_SIZE;
 
         private AtomicInteger status = new AtomicInteger(-1);
 
@@ -138,7 +146,7 @@ public class SocketSender  {
         public ClientThread(String remoteHost, int remotePort) {
             this.remoteHost = remoteHost;
             this.remotePort = remotePort;
-            BUFFER_SIZE = plugin.getConfig().getIntegerParam("stunnel__buffer_size",8192);
+            //BUFFER_SIZE = plugin.getConfig().getIntegerParam("stunnel__buffer_size",8192);
         }
 
         /**
@@ -225,7 +233,7 @@ public class SocketSender  {
 
     class ForwardThread extends Thread {
         //private final int BUFFER_SIZE = 8192;
-        private final int BUFFER_SIZE = 8192;
+        //private final int BUFFER_SIZE = 8192;
 
         InputStream mInputStream;
         OutputStream mOutputStream;
@@ -250,7 +258,7 @@ public class SocketSender  {
                     int debugCount = -1;
                     try {
 
-                        byte[] buffer = new byte[BUFFER_SIZE];
+                        byte[] buffer = new byte[bufferSize];
 
                         if (msg instanceof BytesMessage) {
                             int bytesRead = ((BytesMessage) msg).readBytes(buffer);
@@ -319,7 +327,7 @@ public class SocketSender  {
 
             forwardingActive = true;
 
-            byte[] buffer = new byte[BUFFER_SIZE];
+            byte[] buffer = new byte[bufferSize];
             try {
                 while (forwardingActive) {
                     int bytesRead = mInputStream.read(buffer);

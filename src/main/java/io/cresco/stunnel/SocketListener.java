@@ -36,20 +36,23 @@ public class SocketListener implements Runnable  {
     private final AtomicBoolean clientStatusLock;
     private Map<String, SocketController.StatusType> clientStatus;
 
-
+    public int bufferSize;
     private SocketController socketController;
 
-    public SocketListener(PluginBuilder plugin, SocketController socketController, String sTunnelId, int srcPort)  {
+    public SocketListener(PluginBuilder plugin, SocketController socketController, String sTunnelId, int srcPort, int bufferSize)  {
         this.plugin = plugin;
         this.socketController = socketController;
         logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
         this.sTunnelId = sTunnelId;
         this.srcPort = srcPort;
+        this.bufferSize = bufferSize;
         clientThreadsLock = new AtomicBoolean();
         clientThreads = Collections.synchronizedMap(new HashMap<>());
         clientStatusLock = new AtomicBoolean();
         clientStatus = Collections.synchronizedMap(new HashMap<>());
     }
+
+
 
     public void close() {
 
@@ -288,7 +291,7 @@ public class SocketListener implements Runnable  {
     }
 
     class ForwardThread extends Thread {
-        private final int BUFFER_SIZE;
+        //private final int BUFFER_SIZE;
 
         InputStream mInputStream;
         OutputStream mOutputStream;
@@ -303,13 +306,13 @@ public class SocketListener implements Runnable  {
          * its parent, input stream and output stream.
          */
         String clientId;
-        public ForwardThread(ClientThread aParent, InputStream aInputStream, OutputStream aOutputStream, String clientId) throws JMSException {
+        public ForwardThread(ClientThread aParent, InputStream aInputStream, OutputStream aOutputStream, String clientId) {
             //logger.info("Plugin " + plugin.getPluginID() + " creating forwarding thread.");
             mParent = aParent;
             mInputStream = aInputStream;
             mOutputStream = aOutputStream;
             this.clientId = clientId;
-            BUFFER_SIZE = plugin.getConfig().getIntegerParam("stunnel__buffer_size",8192);
+            //BUFFER_SIZE = plugin.getConfig().getIntegerParam("stunnel__buffer_size",8192);
 
 
             //messages in
@@ -317,7 +320,7 @@ public class SocketListener implements Runnable  {
                 public void onMessage(Message msg) {
                     try {
 
-                        byte[] buffer = new byte[BUFFER_SIZE];
+                        byte[] buffer = new byte[bufferSize];
 
                         if (msg instanceof BytesMessage) {
                             //logger.info("WE GOT SOMETHING BYTES L");
@@ -388,7 +391,7 @@ public class SocketListener implements Runnable  {
          * about the failure.
          */
         public void run() {
-            byte[] buffer = new byte[BUFFER_SIZE];
+            byte[] buffer = new byte[bufferSize];
             try {
                 while (forwardingActive) {
 

@@ -52,7 +52,7 @@ public class SocketController  {
         mapType = new TypeToken<Map<String, String>>(){}.getType();
     }
 
-    public boolean createSrcTunnel(int srcPort, String dstHost, int dstPort, String dstRegion, String dstAgent, String dstPlugin) {
+    public boolean createSrcTunnel(int srcPort, String dstHost, int dstPort, String dstRegion, String dstAgent, String dstPlugin, int bufferSize) {
         boolean isCreated = false;
 
         try{
@@ -71,6 +71,7 @@ public class SocketController  {
             tunnelConfig.put("src_region", plugin.getRegion());
             tunnelConfig.put("src_agent", plugin.getAgent());
             tunnelConfig.put("src_plugin", plugin.getPluginID());
+            tunnelConfig.put("buffer_size", String.valueOf(bufferSize));
 
             logger.error("(2): [REMOVED] send message to remote plugin and check if dst host/port is listening");
             //send message to remote plugin and check if dst host/port is listening
@@ -118,7 +119,7 @@ public class SocketController  {
 
             logger.error("(3): remote port is listening, start SocketListener()");
             //create listener
-            socketListener = new SocketListener(plugin, this, sTunnelId, srcPort);
+            socketListener = new SocketListener(plugin, this, sTunnelId, srcPort, bufferSize);
 
             //start new listner thread
             new Thread(socketListener).start();
