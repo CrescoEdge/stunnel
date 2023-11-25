@@ -72,8 +72,9 @@ public class SocketController  {
             tunnelConfig.put("src_agent", plugin.getAgent());
             tunnelConfig.put("src_plugin", plugin.getPluginID());
 
-            logger.error("(2): send message to remote plugin and check if dst host/port is listening");
+            logger.error("(2): [REMOVED] send message to remote plugin and check if dst host/port is listening");
             //send message to remote plugin and check if dst host/port is listening
+            /*
             MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, dstRegion, dstAgent, dstPlugin);
             request.setParam("action", "dstportcheck");
             request.setParam("action_dst_host", dstHost);
@@ -107,8 +108,20 @@ public class SocketController  {
                 logger.error("Failed to create tunnel error: Remote dstTunnel config failed.");
             }
 
-            //start port listener here
-            //on first
+             */
+
+            //now set status to init
+            setTunnelStatus(sTunnelId,StatusType.INIT);
+
+            //set the tunnel config
+            setTunnelConfig(sTunnelId, tunnelConfig);
+
+            logger.error("(3): remote port is listening, start SocketListener()");
+            //create listener
+            socketListener = new SocketListener(plugin, this, sTunnelId, srcPort);
+
+            //start new listner thread
+            new Thread(socketListener).start();
 
         } catch (Exception ex) {
             logger.error("Failed to create tunnel error: " + ex.getMessage());
@@ -157,21 +170,15 @@ public class SocketController  {
 
         try{
 
-            //String sTunnelId = tunnelConfig.get("stunnel_id");
-
-            //logger.info("createDstTunnel NEW MAP: " + tunnelConfig);
-
             socketSender = new SocketSender(plugin, this, tunnelConfig);
-            socketSender.go();
-
-            //configure our own listeners and control callbacks
-            //String dstListenerId = getControlDBListener(sTunnelId, "control", "dst");
-            //tunnelConfig.put("dst_listener_id", dstListenerId);
-
-            //set status
-            //setTunnelStatus(dstListenerId,StatusType.ACTIVE);
+            if(!socketSender.start()) {
+                tunnelConfig = null;
+                logger.error("Unable to start socketSender.");
+            }
 
         } catch (Exception ex) {
+            logger.error("Unable to createDstTunnel: " + ex.getMessage());
+            logger.error("tunnelConfig: " + tunnelConfig);
             tunnelConfig = null;
             ex.printStackTrace();
         }
@@ -182,6 +189,9 @@ public class SocketController  {
     public void shutdown() {
         if(socketListener != null) {
             socketListener.close();
+        }
+        if(socketSender != null) {
+            socketSender.close();
         }
     }
     private String getControlDBListener(String sTunnelId, String stype, String direction) {

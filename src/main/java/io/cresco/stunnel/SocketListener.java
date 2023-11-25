@@ -71,11 +71,12 @@ public class SocketListener implements Runnable  {
             serverSocket = new ServerSocket(srcPort);
             socketController.setTunnelStatus(sTunnelId, SocketController.StatusType.ACTIVE);
 
+            logger.error("(4): port open and waiting for incoming request on port: " + srcPort);
+
             while(isActive) {
 
                 try {
 
-                    logger.error("(4): port open and waiting for incoming request on port: " + srcPort);
                     Socket clientSocket = serverSocket.accept();
 
                     String clientId = UUID.randomUUID().toString();
@@ -104,7 +105,6 @@ public class SocketListener implements Runnable  {
         } catch (IOException e) {
             throw new RuntimeException(e);
         } finally {
-
             synchronized (clientThreadsLock) {
 
                 for (Map.Entry<String, ClientThread> entry : clientThreads.entrySet()) {
@@ -264,12 +264,19 @@ public class SocketListener implements Runnable  {
                 request.setParam("action", "configdsttunnel");
                 request.setParam("action_tunnel_config", gson.toJson(tunnelConfig));
                 MsgEvent response = plugin.sendRPC(request);
-                logger.error("DO SOMETHING WITH CONFIG DST TUNNEL: " + response.getParams().toString());
-                //System.out.println(response.getParams());
-                //lets assume all is good and start my side
 
-                clientForward.start();
-                logger.error("(12): clientForward started");
+                if(response.getParam("status") != null) {
+                    int status = Integer.parseInt(response.getParam("status"));
+                    if(status == 10) {
+                        clientForward.start();
+                        logger.error("(12): clientForward started");
+                    } else {
+                        logger.error("Error in config of dst tunnel: " + response.getParams());
+                        close();
+                    }
+                } else {
+                    logger.error("Error in config of dst tunnel: Missing status from response: " + response.getParams());
+                }
 
             } catch (Exception ex) {
                 ex.printStackTrace();
@@ -281,7 +288,7 @@ public class SocketListener implements Runnable  {
     }
 
     class ForwardThread extends Thread {
-        private final int BUFFER_SIZE = 8192;
+        private final int BUFFER_SIZE;
 
         InputStream mInputStream;
         OutputStream mOutputStream;
@@ -302,6 +309,7 @@ public class SocketListener implements Runnable  {
             mInputStream = aInputStream;
             mOutputStream = aOutputStream;
             this.clientId = clientId;
+            BUFFER_SIZE = plugin.getConfig().getIntegerParam("stunnel__buffer_size",8192);
 
 
             //messages in
@@ -342,14 +350,37 @@ public class SocketListener implements Runnable  {
 
         public void close () {
 
-            logger.error("ForwardThread close()");
-
             if(node_from_listner_id != null) {
+                logger.error("(14) ForwardThread close() removing node_from_listner_id: " + node_from_listner_id);
                 plugin.getAgentService().getDataPlaneService().removeMessageListener(node_from_listner_id);
+                node_from_listner_id = null;
             }
 
             forwardingActive = false;
         }
+
+        private void connectionBroken() {
+
+            mParent.close();
+            //close remote
+            Map<String,String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
+            MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
+            request.setParam("action", "closedstclient");
+            request.setParam("action_client_id", clientId);
+            MsgEvent response = plugin.sendRPC(request);
+            if(response.getParam("status") != null) {
+                int status = Integer.parseInt(response.getParam("status"));
+                if(status == 10) {
+                    logger.info("(15) Dst port confirmed closed.");
+                } else {
+                    logger.error("Error in closing dst port: " + response.getParams());
+                }
+            } else {
+                logger.error("Missing status from response: " + response.getParams());
+            }
+
+        }
+
         /**
          * Runs the thread. Continuously reads the input stream and
          * writes the read data to the output stream. If reading or
@@ -363,22 +394,8 @@ public class SocketListener implements Runnable  {
 
                     int bytesRead = mInputStream.read(buffer);
                     if (bytesRead == -1) {
-                        logger.error("BREAK CALLED: SRC PORT CLOSED");
-                        mParent.close();
-                        //close remote
-                        Map<String,String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
-                        MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
-                        request.setParam("action", "closedstclient");
-                        request.setParam("action_client_id", clientId);
-                        MsgEvent response = plugin.sendRPC(request);
-                        if(response.getParam("status") != null) {
-                            int status = Integer.parseInt(response.getParam("status"));
-                            if(status != 10) {
-                                logger.error("Error in closing src port: " + response.getParams());
-                            }
-                        } else {
-                            logger.error("Missing status from response: " + response.getParams());
-                        }
+                        logger.error("(13) src port closed by external");
+                        connectionBroken();
 
                     }
 
@@ -402,8 +419,10 @@ public class SocketListener implements Runnable  {
                         mParent.mClientSocket.isBound() + " isConnected: " + mParent.mClientSocket.isConnected() +
                         " isinputshut: " + mParent.mClientSocket.isInputShutdown() + " isoutputshut: "
                         + mParent.mClientSocket.isOutputShutdown());
+                connectionBroken();
             } catch (Exception ex) {
                 logger.error("SOME EXCEPTION: " + ex.getMessage());
+                connectionBroken();
             }
 
             // Notify parent thread that the connection is broken

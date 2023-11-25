@@ -14,6 +14,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 //https://www.nakov.com/books/inetjava/source-code-html/Chapter-1-Sockets/1.4-TCP-Sockets/TCPForwardServer.java.html
 
@@ -46,11 +47,36 @@ public class SocketSender  {
         clientThreads = Collections.synchronizedMap(new HashMap<>());
     }
 
-    public void go() {
+    public boolean start() {
+        boolean isStarted = false;
+        try {
+            setClientThreads(clientId, remoteHost, remotePort);
+            getClientThread(clientId).start();
+            while (getClientThread(clientId).getStatus() == -1) {
+                Thread.sleep(100);
+            }
+            logger.debug("boolean start() STATUS: " + getClientThread(clientId).getStatus());
+            if (getClientThread(clientId).getStatus() == 10) {
+                isStarted = true;
+            }
+            logger.error("(8): [dst] ClientThread started: " + isStarted + " status: " + getClientThread(clientId).getStatus());
+        } catch (Exception ex) {
+            logger.error("(8): [dst] ClientThread error: " + ex.getMessage());
+        }
+        return isStarted;
+    }
 
-        setClientThreads(clientId, remoteHost, remotePort);
-        getClientThread(clientId).start();
-        logger.error("(8): [dst] ClientThread started");
+    public void close() {
+
+        synchronized (clientThreadsLock) {
+
+            for (Map.Entry<String, ClientThread> entry : clientThreads.entrySet()) {
+                String clientId = entry.getKey();
+                ClientThread clientThread = entry.getValue();
+                clientThread.close();
+                logger.info("Shutting down clientID: " + clientId);
+            }
+        }
 
     }
 
@@ -59,11 +85,10 @@ public class SocketSender  {
         try {
             ClientThread clientThread = getClientThread(clientId);
             if(clientThread != null) {
-                logger.error("clientThread != null");
+                clientThread.close();
             } else {
-                logger.error("clientThread == null");
+                logger.error("closeClient() client_id: " +clientId + " clientThread == null");
             }
-
             removeClientThread(clientId);
             isClosed = true;
 
@@ -99,10 +124,11 @@ public class SocketSender  {
     }
 
     class ClientThread extends Thread {
-        private final int BUFFER_SIZE = 8192;
+        private int BUFFER_SIZE;
+
+        private AtomicInteger status = new AtomicInteger(-1);
 
         private Socket mServerSocket;
-        private boolean mForwardingActive = false;
 
         private String remoteHost;
         private int remotePort;
@@ -112,6 +138,7 @@ public class SocketSender  {
         public ClientThread(String remoteHost, int remotePort) {
             this.remoteHost = remoteHost;
             this.remotePort = remotePort;
+            BUFFER_SIZE = plugin.getConfig().getIntegerParam("stunnel__buffer_size",8192);
         }
 
         /**
@@ -120,12 +147,22 @@ public class SocketSender  {
          * client and the server.
          */
 
+        public int getStatus() {
+            return status.get();
+        }
+        public void setStatus(int inStatus) {
+            status.set(inStatus);
+        }
+
         public void close() {
 
             try {
 
                 if(clientForward != null) {
+                    logger.debug("CALLING CLOSE ON clientForward");
                     clientForward.close();
+                } else {
+                    logger.error("CALLING CLOSE ON NULL clientForward");
                 }
 
                 if(mServerSocket != null) {
@@ -133,12 +170,15 @@ public class SocketSender  {
                         mServerSocket.close();
                     }
                 }
+
             } catch (Exception ex) {
                 logger.error("ClientThread close() error: " + ex.getMessage());
             }
 
-        }
+            //99 is closed
+            setStatus(99);
 
+        }
 
 
         public void run() {
@@ -161,17 +201,22 @@ public class SocketSender  {
 
                 clientForward = new ForwardThread(this, serverIn, serverOut);
                 clientForward.start();
-                logger.error("(11): [dst] ForwardThread started");
+
+                setStatus(10);
+                logger.error("(11): [dst] ForwardThread started. status: " + status.get());
 
 
+            } catch (Exception ex) {
 
-            } catch (IOException | JMSException ioe) {
-                logger.error("Can not connect to " + remoteHost + " " + remotePort);
+                setStatus(9);
+                logger.error("Can not connect to " + remoteHost + " " + remotePort + " status:" + status.get());
+                logger.error("Exception: " + ex.getMessage());
                 //System.err.println("Can not connect to " + remoteHost + " " + remotePort);
                         //TCPForwardServer.DESTINATION_HOST + ":" +
                         //TCPForwardServer.DESTINATION_PORT);
                 //connectionBroken();
-                return;
+                //return;
+                close();
             }
 
 
@@ -189,7 +234,6 @@ public class SocketSender  {
         boolean forwardingActive = false;
 
         String node_from_listner_id;
-
         //BytesMessage bytesMessage;
         /**
          * Creates a new traffic redirection thread specifying
@@ -227,10 +271,6 @@ public class SocketSender  {
                 }
             };
 
-            if(node_from_listner_id != null) {
-                logger.error("WHY IS LIST NO NULL? l_id:" + node_from_listner_id );
-            }
-
             String queryString = "stunnel_id='" + sTunnelId + "' and client_id='" + clientId + "' and direction='dst'";
             node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.AGENT,ml,queryString);
             logger.error("(10): [dst] listner: " + node_from_listner_id + " started");
@@ -238,10 +278,11 @@ public class SocketSender  {
 
         public void close () {
 
-            logger.error("ForwardThread close()");
 
             if(node_from_listner_id != null) {
+                logger.error("(14) [dst] ForwardThread close() removing node_from_listner_id: " + node_from_listner_id);
                 plugin.getAgentService().getDataPlaneService().removeMessageListener(node_from_listner_id);
+                node_from_listner_id = null;
             }
 
             forwardingActive = false;
@@ -258,7 +299,9 @@ public class SocketSender  {
             MsgEvent response = plugin.sendRPC(request);
             if(response.getParam("status") != null) {
                 int status = Integer.parseInt(response.getParam("status"));
-                if(status != 10) {
+                if(status == 10) {
+                    logger.info("(15) [dst] Src port confirmed closed.");
+                } else {
                     logger.error("Error in closing src port: " + response.getParams());
                 }
             } else {
@@ -281,7 +324,7 @@ public class SocketSender  {
                 while (forwardingActive) {
                     int bytesRead = mInputStream.read(buffer);
                     if (bytesRead == -1) {
-                        logger.error("BREAK CALLED: DST PORT CLOSED");
+                        logger.error("(13) [dst] dst port closed by external");
                         connectionBroken();
                     }
 
