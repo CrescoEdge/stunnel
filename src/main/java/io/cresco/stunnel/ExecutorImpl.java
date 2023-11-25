@@ -54,6 +54,10 @@ public class ExecutorImpl implements Executor {
                     return createDstTunnel(incoming);
                 case "dstportcheck":
                     return dstPortCheck(incoming);
+                case "closesrcclient":
+                    return closeSrcClient(incoming);
+                case "closedstclient":
+                    return closeDstClient(incoming);
 
                 default:
                     logger.error("Unknown configtype found {} for {}:", incoming.getParam("action"), incoming.getMsgType().toString());
@@ -78,15 +82,6 @@ public class ExecutorImpl implements Executor {
 
         if(incoming.getParams().containsKey("action")) {
             switch (incoming.getParam("action")) {
-                /*
-                case "listensrc":
-                    return listenSrc(incoming);
-                case "listendst":
-                    return listenDst(incoming);
-                case "test":
-                    return test(incoming);
-
-                 */
 
                 default:
                     logger.error("Unknown configtype found {} for {}:", incoming.getParam("action"), incoming.getMsgType().toString());
@@ -210,6 +205,63 @@ public class ExecutorImpl implements Executor {
         }
         return incoming;
     }
+
+    private MsgEvent closeSrcClient(MsgEvent incoming) {
+
+        try {
+
+            if (incoming.getParam("action_client_id") != null) {
+
+
+                boolean closeClient = socketController.socketListener.closeClient(incoming.getParam("action_client_id"));
+                if(closeClient) {
+                    incoming.setParam("status", "10");
+                    incoming.setParam("status_desc", "dst tunnel config created");
+                } else {
+                    incoming.setParam("status", "9");
+                    incoming.setParam("status_desc", "unable to create dst tunnel config");
+                }
+
+            } else {
+                incoming.setParam("status", "8");
+                incoming.setParam("status_desc", "missing required parameter(s)");
+            }
+        } catch (Exception ex) {
+            incoming.setParam("status", "7");
+            incoming.setParam("status_desc", "error " + ex.getMessage());
+            ex.printStackTrace();
+        }
+        return incoming;
+    }
+
+    private MsgEvent closeDstClient(MsgEvent incoming) {
+
+        try {
+
+            if (incoming.getParam("action_client_id") != null) {
+
+
+                boolean closeClient = socketController.socketSender.closeClient(incoming.getParam("action_client_id"));
+                if(closeClient) {
+                    incoming.setParam("status", "10");
+                    incoming.setParam("status_desc", "dst tunnel config created");
+                } else {
+                    incoming.setParam("status", "9");
+                    incoming.setParam("status_desc", "unable to create dst tunnel config");
+                }
+
+            } else {
+                incoming.setParam("status", "8");
+                incoming.setParam("status_desc", "missing required parameter(s)");
+            }
+        } catch (Exception ex) {
+            incoming.setParam("status", "7");
+            incoming.setParam("status_desc", "error " + ex.getMessage());
+            ex.printStackTrace();
+        }
+        return incoming;
+    }
+
 
     private boolean isSrcPortFree(int port) {
 

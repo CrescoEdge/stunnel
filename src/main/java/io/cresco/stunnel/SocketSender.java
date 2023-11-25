@@ -1,6 +1,7 @@
 package io.cresco.stunnel;
 
 import io.cresco.library.data.TopicType;
+import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
@@ -9,7 +10,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 //https://www.nakov.com/books/inetjava/source-code-html/Chapter-1-Sockets/1.4-TCP-Sockets/TCPForwardServer.java.html
 
@@ -24,6 +28,10 @@ public class SocketSender  {
     private String remoteHost;
     private int remotePort;
 
+    private final AtomicBoolean clientThreadsLock;
+    private Map<String, ClientThread> clientThreads;
+
+
     public SocketController socketController;
 
     public SocketSender(PluginBuilder plugin, SocketController socketController, Map<String,String> tunnelConfig)  {
@@ -34,13 +42,59 @@ public class SocketSender  {
         this.clientId = tunnelConfig.get("client_id");
         this.remoteHost = tunnelConfig.get("dst_host");
         this.remotePort = Integer.parseInt(tunnelConfig.get("dst_port"));
+        clientThreadsLock = new AtomicBoolean();
+        clientThreads = Collections.synchronizedMap(new HashMap<>());
     }
 
     public void go() {
 
-        ClientThread clientThread = new ClientThread(remoteHost, remotePort);
-        clientThread.start();
+        setClientThreads(clientId, remoteHost, remotePort);
+        getClientThread(clientId).start();
         logger.error("(8): [dst] ClientThread started");
+
+    }
+
+    public boolean closeClient(String clientId) {
+        boolean isClosed = false;
+        try {
+            ClientThread clientThread = getClientThread(clientId);
+            if(clientThread != null) {
+                logger.error("clientThread != null");
+            } else {
+                logger.error("clientThread == null");
+            }
+
+            removeClientThread(clientId);
+            isClosed = true;
+
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+
+        return isClosed;
+    }
+
+    private ClientThread getClientThread(String clientId) {
+
+        ClientThread clientThread;
+        synchronized (clientThreadsLock) {
+            clientThread = clientThreads.get(clientId);
+        }
+        return clientThread;
+    }
+    private void removeClientThread(String clientId) {
+
+        synchronized (clientThreadsLock) {
+            clientThreads.remove(clientId);
+        }
+
+    }
+
+    private void setClientThreads(String clientId, String remoteHost, int remotePort) {
+
+        synchronized (clientThreadsLock) {
+            clientThreads.put(clientId, new ClientThread(remoteHost, remotePort));
+        }
 
     }
 
@@ -53,6 +107,8 @@ public class SocketSender  {
         private String remoteHost;
         private int remotePort;
 
+        private ForwardThread clientForward;
+
         public ClientThread(String remoteHost, int remotePort) {
             this.remoteHost = remoteHost;
             this.remotePort = remotePort;
@@ -63,6 +119,28 @@ public class SocketSender  {
          * starts bidirectional forwarding ot data between the
          * client and the server.
          */
+
+        public void close() {
+
+            try {
+
+                if(clientForward != null) {
+                    clientForward.close();
+                }
+
+                if(mServerSocket != null) {
+                    if(!mServerSocket.isClosed()) {
+                        mServerSocket.close();
+                    }
+                }
+            } catch (Exception ex) {
+                logger.error("ClientThread close() error: " + ex.getMessage());
+            }
+
+        }
+
+
+
         public void run() {
             InputStream serverIn;
             OutputStream serverOut;
@@ -81,7 +159,7 @@ public class SocketSender  {
                 serverOut = mServerSocket.getOutputStream();
 
 
-                ForwardThread clientForward = new ForwardThread(this, serverIn, serverOut);
+                clientForward = new ForwardThread(this, serverIn, serverOut);
                 clientForward.start();
                 logger.error("(11): [dst] ForwardThread started");
 
@@ -108,7 +186,10 @@ public class SocketSender  {
         OutputStream mOutputStream;
         ClientThread mParent;
 
+        boolean forwardingActive = false;
+
         String node_from_listner_id;
+
         //BytesMessage bytesMessage;
         /**
          * Creates a new traffic redirection thread specifying
@@ -119,36 +200,72 @@ public class SocketSender  {
             mParent = aParent;
             mInputStream = aInputStream;
             mOutputStream = aOutputStream;
-            //bytesMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
-            //bytesMessage.setStringProperty("stunnel_name",sTunnelId);
 
-            //messages in
             MessageListener ml = new MessageListener() {
                 public void onMessage(Message msg) {
+                    int debugCount = -1;
                     try {
 
                         byte[] buffer = new byte[BUFFER_SIZE];
 
                         if (msg instanceof BytesMessage) {
                             int bytesRead = ((BytesMessage) msg).readBytes(buffer);
+                            debugCount = bytesRead;
                             //logger.info("Message In: " + new String(buffer));
-                            logger.error("Message In: " + bytesRead);
+                            //logger.debug("Message In: " + bytesRead);
                             mOutputStream.write(buffer, 0, bytesRead);
                             mOutputStream.flush();
                         }
 
                     } catch(Exception ex) {
-
+                        logger.error("mParent.mServerSocket isClosed: " + mParent.mServerSocket.isClosed() + " isBound: " +
+                                mParent.mServerSocket.isBound() + " isConnected: " + mParent.mServerSocket.isConnected() +
+                                " isinputshut: " + mParent.mServerSocket.isInputShutdown() + " isoutputshut: "
+                                + mParent.mServerSocket.isOutputShutdown() + " bytes read: " + debugCount);
                         ex.printStackTrace();
                     }
                 }
             };
+
+            if(node_from_listner_id != null) {
+                logger.error("WHY IS LIST NO NULL? l_id:" + node_from_listner_id );
+            }
 
             String queryString = "stunnel_id='" + sTunnelId + "' and client_id='" + clientId + "' and direction='dst'";
             node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.AGENT,ml,queryString);
             logger.error("(10): [dst] listner: " + node_from_listner_id + " started");
         }
 
+        public void close () {
+
+            logger.error("ForwardThread close()");
+
+            if(node_from_listner_id != null) {
+                plugin.getAgentService().getDataPlaneService().removeMessageListener(node_from_listner_id);
+            }
+
+            forwardingActive = false;
+        }
+
+        private void connectionBroken() {
+
+            mParent.close();
+            //close remote
+            Map<String,String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
+            MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
+            request.setParam("action", "closesrcclient");
+            request.setParam("action_client_id", clientId);
+            MsgEvent response = plugin.sendRPC(request);
+            if(response.getParam("status") != null) {
+                int status = Integer.parseInt(response.getParam("status"));
+                if(status != 10) {
+                    logger.error("Error in closing src port: " + response.getParams());
+                }
+            } else {
+                logger.error("Missing status from response: " + response.getParams());
+            }
+
+        }
         /**
          * Runs the thread. Continuously reads the input stream and
          * writes the read data to the output stream. If reading or
@@ -156,12 +273,17 @@ public class SocketSender  {
          * about the failure.
          */
         public void run() {
+
+            forwardingActive = true;
+
             byte[] buffer = new byte[BUFFER_SIZE];
             try {
-                while (true) {
+                while (forwardingActive) {
                     int bytesRead = mInputStream.read(buffer);
-                    if (bytesRead == -1)
-                        break; // End of stream is reached --> exit
+                    if (bytesRead == -1) {
+                        logger.error("BREAK CALLED: DST PORT CLOSED");
+                        connectionBroken();
+                    }
 
                     if(bytesRead > 0) {
                         BytesMessage bytesMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
@@ -170,6 +292,7 @@ public class SocketSender  {
                         bytesMessage.setStringProperty("client_id", clientId);
                         bytesMessage.writeBytes(buffer, 0, bytesRead);
                         plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT, bytesMessage);
+                        //logger.error(String.valueOf(isSent));
 
                         logger.debug("Plugin " + plugin.getPluginID() + " writing " + buffer.length + " bytes to stunnel_name:" + sTunnelId);
                     }
@@ -178,8 +301,15 @@ public class SocketSender  {
                 }
             } catch (IOException e) {
                 // Read/write failed --> connection is broken
-            } catch (JMSException e) {
-                throw new RuntimeException(e);
+                logger.error("run() mParent.mServerSocket isClosed: " + mParent.mServerSocket.isClosed() + " isBound: " +
+                        mParent.mServerSocket.isBound() + " isConnected: " + mParent.mServerSocket.isConnected() +
+                        " isinputshut: " + mParent.mServerSocket.isInputShutdown() + " isoutputshut: "
+                        + mParent.mServerSocket.isOutputShutdown());
+                logger.error("IOException error: " + e.getMessage());
+                connectionBroken();
+            } catch (Exception ex) {
+                logger.error("SOME EXCEPTION: " + ex.getMessage());
+                connectionBroken();
             }
 
             // Notify parent thread that the connection is broken

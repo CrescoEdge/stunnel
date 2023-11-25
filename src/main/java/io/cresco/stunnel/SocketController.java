@@ -33,7 +33,8 @@ public class SocketController  {
     private final AtomicBoolean tunnelListenersLock;
     private Map<String, SocketListener> tunnelListners;
 
-    private SocketListener socketListener;
+    public SocketListener socketListener;
+    public SocketSender socketSender;
     private Gson gson;
 
     public Type mapType;
@@ -160,7 +161,7 @@ public class SocketController  {
 
             //logger.info("createDstTunnel NEW MAP: " + tunnelConfig);
 
-            SocketSender socketSender = new SocketSender(plugin, this, tunnelConfig);
+            socketSender = new SocketSender(plugin, this, tunnelConfig);
             socketSender.go();
 
             //configure our own listeners and control callbacks

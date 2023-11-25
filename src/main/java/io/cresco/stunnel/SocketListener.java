@@ -84,7 +84,7 @@ public class SocketListener implements Runnable  {
                     //set thread, arrange comm with remote host
                     setClientThreads(this, clientId, clientSocket);
                     //start thread
-                    new Thread(getClientThreads(clientId)).start();
+                    new Thread(getClientThread(clientId)).start();
 
 
 
@@ -145,13 +145,34 @@ public class SocketListener implements Runnable  {
 
     }
 
-    private ClientThread getClientThreads(String clientId) {
+    public boolean closeClient(String clientId) {
+        boolean isClosed = false;
+        try {
+            getClientThread(clientId).close();
+            removeClientThread(clientId);
+            isClosed = true;
+
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+
+        return isClosed;
+    }
+
+    private ClientThread getClientThread(String clientId) {
 
         ClientThread clientThread;
         synchronized (clientThreadsLock) {
             clientThread = clientThreads.get(clientId);
         }
         return clientThread;
+    }
+    private void removeClientThread(String clientId) {
+
+        synchronized (clientThreadsLock) {
+            clientThreads.remove(clientId);
+        }
+
     }
 
     public void closeSocket() {
@@ -243,6 +264,7 @@ public class SocketListener implements Runnable  {
                 request.setParam("action", "configdsttunnel");
                 request.setParam("action_tunnel_config", gson.toJson(tunnelConfig));
                 MsgEvent response = plugin.sendRPC(request);
+                logger.error("DO SOMETHING WITH CONFIG DST TUNNEL: " + response.getParams().toString());
                 //System.out.println(response.getParams());
                 //lets assume all is good and start my side
 
@@ -256,31 +278,6 @@ public class SocketListener implements Runnable  {
 
         }
 
-    }
-
-    private boolean configureRemoteClient(String clientId) {
-
-        boolean isReady = false;
-
-        try {
-            //on connect create client id and notify remote side of client id
-            TextMessage textMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
-            textMessage.setStringProperty("stunnel_name", sTunnelId);
-            textMessage.setStringProperty("stype", "control");
-            textMessage.setStringProperty("direction", "dst");
-            textMessage.setStringProperty("client_id", clientId);
-            textMessage.setText("Notification to dst to start listening for client_id: " + clientId + " messages.");
-            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT, textMessage);
-            logger.error("Sent message to dst on dp for client_id: " + clientId);
-
-
-            //do conformation
-            isReady = true;
-        } catch (Exception ex) {
-            ex.printStackTrace();
-        }
-
-        return isReady;
     }
 
     class ForwardThread extends Thread {
@@ -318,7 +315,7 @@ public class SocketListener implements Runnable  {
                             //logger.info("WE GOT SOMETHING BYTES L");
                             int bytesRead = ((BytesMessage) msg).readBytes(buffer);
                             //logger.info("Message In: " + new String(buffer));
-                            logger.error("Message In: " + bytesRead);
+                            logger.debug("Message In: " + bytesRead);
                             mOutputStream.write(buffer, 0, bytesRead);
                             mOutputStream.flush();
                         }
@@ -330,6 +327,9 @@ public class SocketListener implements Runnable  {
                 }
             };
 
+            if(node_from_listner_id != null) {
+                logger.error("WHY IS LIST NO NULL? l_id:" + node_from_listner_id );
+            }
 
             String queryString = "stunnel_id='" + sTunnelId + "' and client_id='" + clientId + "' and direction='src'";
             node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.AGENT,ml,queryString);
@@ -360,26 +360,50 @@ public class SocketListener implements Runnable  {
             byte[] buffer = new byte[BUFFER_SIZE];
             try {
                 while (forwardingActive) {
+
                     int bytesRead = mInputStream.read(buffer);
-                    if (bytesRead == -1)
-                        break; // End of stream is reached --> exit
+                    if (bytesRead == -1) {
+                        logger.error("BREAK CALLED: SRC PORT CLOSED");
+                        mParent.close();
+                        //close remote
+                        Map<String,String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
+                        MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
+                        request.setParam("action", "closedstclient");
+                        request.setParam("action_client_id", clientId);
+                        MsgEvent response = plugin.sendRPC(request);
+                        if(response.getParam("status") != null) {
+                            int status = Integer.parseInt(response.getParam("status"));
+                            if(status != 10) {
+                                logger.error("Error in closing src port: " + response.getParams());
+                            }
+                        } else {
+                            logger.error("Missing status from response: " + response.getParams());
+                        }
+
+                    }
+
                     if(bytesRead > 0) {
-                        logger.error("bytesRead: " + bytesRead);
+                        //logger.error("bytesRead: " + bytesRead);
                         BytesMessage bytesMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
                         bytesMessage.setStringProperty("stunnel_id", sTunnelId);
                         bytesMessage.setStringProperty("direction", "dst");
                         bytesMessage.setStringProperty("client_id", clientId);
                         bytesMessage.writeBytes(buffer, 0, bytesRead);
                         plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT, bytesMessage);
+                        //logger.error(String.valueOf(isSent));
+
                         logger.debug("Plugin " + plugin.getPluginID() + " writing " + buffer.length + " bytes to stunnel_name:" + sTunnelId);
                     }
-                    //mOutputStream.write(buffer, 0, bytesRead);
-                    //mOutputStream.flush();
+
                 }
             } catch (IOException e) {
                 // Read/write failed --> connection is broken
-            } catch (JMSException e) {
-                throw new RuntimeException(e);
+                logger.error("run() mParent.mServerSocket isClosed: " + mParent.mClientSocket.isClosed() + " isBound: " +
+                        mParent.mClientSocket.isBound() + " isConnected: " + mParent.mClientSocket.isConnected() +
+                        " isinputshut: " + mParent.mClientSocket.isInputShutdown() + " isoutputshut: "
+                        + mParent.mClientSocket.isOutputShutdown());
+            } catch (Exception ex) {
+                logger.error("SOME EXCEPTION: " + ex.getMessage());
             }
 
             // Notify parent thread that the connection is broken
