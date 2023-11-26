@@ -94,7 +94,7 @@ public class ExecutorImpl implements Executor {
 
     @Override
     public MsgEvent executeWATCHDOG(MsgEvent incoming) { return null; }
-    
+
     @Override
     public MsgEvent executeKPI(MsgEvent incoming) { return null; }
 
