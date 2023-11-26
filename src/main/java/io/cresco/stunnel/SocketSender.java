@@ -255,25 +255,23 @@ public class SocketSender  {
 
             MessageListener ml = new MessageListener() {
                 public void onMessage(Message msg) {
-                    int debugCount = -1;
                     try {
 
-                        byte[] buffer = new byte[bufferSize];
+                        //byte[] buffer = new byte[bufferSize];
 
                         if (msg instanceof BytesMessage) {
+                            byte[] buffer = new byte[(int)((BytesMessage) msg).getBodyLength()];
                             int bytesRead = ((BytesMessage) msg).readBytes(buffer);
-                            debugCount = bytesRead;
-                            //logger.info("Message In: " + new String(buffer));
-                            //logger.debug("Message In: " + bytesRead);
                             mOutputStream.write(buffer, 0, bytesRead);
                             mOutputStream.flush();
+                            //logger.error("bufferSize length: " + buffer.length + " bytesRead: " + bytesRead + " body length:" + ((BytesMessage) msg).getBodyLength());
                         }
 
                     } catch(Exception ex) {
                         logger.error("mParent.mServerSocket isClosed: " + mParent.mServerSocket.isClosed() + " isBound: " +
                                 mParent.mServerSocket.isBound() + " isConnected: " + mParent.mServerSocket.isConnected() +
                                 " isinputshut: " + mParent.mServerSocket.isInputShutdown() + " isoutputshut: "
-                                + mParent.mServerSocket.isOutputShutdown() + " bytes read: " + debugCount);
+                                + mParent.mServerSocket.isOutputShutdown());
                         ex.printStackTrace();
                     }
                 }
@@ -344,8 +342,7 @@ public class SocketSender  {
                         bytesMessage.writeBytes(buffer, 0, bytesRead);
                         plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT, bytesMessage);
                         //logger.error(String.valueOf(isSent));
-
-                        logger.debug("Plugin " + plugin.getPluginID() + " writing " + buffer.length + " bytes to stunnel_name:" + sTunnelId);
+                        //logger.debug("Plugin " + plugin.getPluginID() + " writing " + buffer.length + " bytes to stunnel_name:" + sTunnelId);
                     }
                     //mOutputStream.write(buffer, 0, bytesRead);
                     //mOutputStream.flush();

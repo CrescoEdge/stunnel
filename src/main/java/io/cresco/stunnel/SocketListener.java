@@ -320,15 +320,12 @@ public class SocketListener implements Runnable  {
                 public void onMessage(Message msg) {
                     try {
 
-                        byte[] buffer = new byte[bufferSize];
-
                         if (msg instanceof BytesMessage) {
-                            //logger.info("WE GOT SOMETHING BYTES L");
+                            byte[] buffer = new byte[(int)((BytesMessage) msg).getBodyLength()];
                             int bytesRead = ((BytesMessage) msg).readBytes(buffer);
-                            //logger.info("Message In: " + new String(buffer));
-                            logger.debug("Message In: " + bytesRead);
                             mOutputStream.write(buffer, 0, bytesRead);
                             mOutputStream.flush();
+                            //logger.error("bufferSize length: " + buffer.length + " bytesRead: " + bytesRead + " body length:" + ((BytesMessage) msg).getBodyLength());
                         }
 
                     } catch(Exception ex) {
@@ -412,7 +409,7 @@ public class SocketListener implements Runnable  {
                         plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT, bytesMessage);
                         //logger.error(String.valueOf(isSent));
 
-                        logger.debug("Plugin " + plugin.getPluginID() + " writing " + buffer.length + " bytes to stunnel_name:" + sTunnelId);
+                        //logger.debug("Plugin " + plugin.getPluginID() + " writing " + buffer.length + " bytes to stunnel_name:" + sTunnelId);
                     }
 
                 }
