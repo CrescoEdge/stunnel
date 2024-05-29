@@ -10,7 +10,7 @@ jobs:
       contents: write
       pull-requests: write
       repository-projects: write
-      
+
     environment: 'SONATYPE CRED'
 
     steps:
