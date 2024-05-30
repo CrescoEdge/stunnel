@@ -6,9 +6,7 @@ import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
 import javax.jms.*;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.*;
 import java.net.Socket;
 import java.util.Collections;
 import java.util.HashMap;
@@ -101,7 +99,11 @@ public class SocketSender  {
             isClosed = true;
 
         } catch (Exception ex) {
-            ex.printStackTrace();
+            logger.error("closeClient clientId: " + clientId + " error!");
+            StringWriter sw = new StringWriter();
+            PrintWriter pw = new PrintWriter(sw);
+            ex.printStackTrace(pw);
+            logger.error(sw.toString());
         }
 
         return isClosed;
@@ -295,23 +297,30 @@ public class SocketSender  {
         }
 
         private void connectionBroken() {
-
-            mParent.close();
-            //close remote
-            Map<String,String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
-            MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
-            request.setParam("action", "closesrcclient");
-            request.setParam("action_client_id", clientId);
-            MsgEvent response = plugin.sendRPC(request);
-            if(response.getParam("status") != null) {
-                int status = Integer.parseInt(response.getParam("status"));
-                if(status == 10) {
-                    logger.info("(15) [dst] Src port confirmed closed.");
+            try {
+                mParent.close();
+                //close remote
+                Map<String, String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
+                MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
+                request.setParam("action", "closesrcclient");
+                request.setParam("action_client_id", clientId);
+                MsgEvent response = plugin.sendRPC(request);
+                if (response.getParam("status") != null) {
+                    int status = Integer.parseInt(response.getParam("status"));
+                    if (status == 10) {
+                        logger.info("(15) [dst] Src port confirmed closed.");
+                    } else {
+                        logger.error("Error in closing src port: " + response.getParams());
+                    }
                 } else {
-                    logger.error("Error in closing src port: " + response.getParams());
+                    logger.error("Missing status from response: " + response.getParams());
                 }
-            } else {
-                logger.error("Missing status from response: " + response.getParams());
+            } catch (Exception ex) {
+                logger.error("connectionBroken: error!");
+                StringWriter sw = new StringWriter();
+                PrintWriter pw = new PrintWriter(sw);
+                ex.printStackTrace(pw);
+                logger.error(sw.toString());
             }
 
         }
@@ -356,7 +365,11 @@ public class SocketSender  {
                 logger.error("IOException error: " + e.getMessage());
                 connectionBroken();
             } catch (Exception ex) {
-                logger.error("SOME EXCEPTION: " + ex.getMessage());
+                logger.error("run: " + ex.getMessage());
+                StringWriter sw = new StringWriter();
+                PrintWriter pw = new PrintWriter(sw);
+                ex.printStackTrace(pw);
+                logger.error(sw.toString());
                 connectionBroken();
             }
 
