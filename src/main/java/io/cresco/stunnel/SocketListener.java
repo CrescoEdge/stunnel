@@ -340,7 +340,7 @@ public class SocketListener implements Runnable  {
             }
 
             String queryString = "stunnel_id='" + sTunnelId + "' and client_id='" + clientId + "' and direction='src'";
-            node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.AGENT,ml,queryString);
+            node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL,ml,queryString);
 
             logger.error("(6): src listner:" + node_from_listner_id + " started");
 
@@ -406,7 +406,7 @@ public class SocketListener implements Runnable  {
                         bytesMessage.setStringProperty("direction", "dst");
                         bytesMessage.setStringProperty("client_id", clientId);
                         bytesMessage.writeBytes(buffer, 0, bytesRead);
-                        plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT, bytesMessage);
+                        plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, bytesMessage);
                         //logger.error(String.valueOf(isSent));
 
                         //logger.debug("Plugin " + plugin.getPluginID() + " writing " + buffer.length + " bytes to stunnel_name:" + sTunnelId);

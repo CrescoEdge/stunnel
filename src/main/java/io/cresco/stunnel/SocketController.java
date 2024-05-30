@@ -213,7 +213,7 @@ public class SocketController  {
 
 
         String queryString = "stunnel_name='" + sTunnelId + "' and stype='" + stype + "' and direction='" + direction + "'";
-        return plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.AGENT,ml,queryString);
+        return plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL,ml,queryString);
 
     }
 

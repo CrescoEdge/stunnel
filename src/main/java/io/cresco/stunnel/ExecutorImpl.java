@@ -355,7 +355,7 @@ public class ExecutorImpl implements Executor {
             updateMessage.setStringProperty("region_id", plugin.getRegion());
             updateMessage.setStringProperty("agent_id", plugin.getAgent());
             updateMessage.setStringProperty("plugin_id", plugin.getPluginID());
-            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT, updateMessage);
+            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, updateMessage);
             logger.info("OUTGOING TEST MESSAGE");
         } catch (Exception ex) {
             ex.printStackTrace();
@@ -460,7 +460,7 @@ public class ExecutorImpl implements Executor {
         //String queryString = "stunnel_name='" + sTunnelId + "' AND broadcast";
         //String queryString = "stunnel_name='" + "t0-t0-t0-t0-t0" + "'";
 
-        String node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.AGENT,ml,queryString);
+        String node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL,ml,queryString);
         logger.info("listenDP Listner: " + node_from_listner_id + " querystring:" + queryString);
 
     }
