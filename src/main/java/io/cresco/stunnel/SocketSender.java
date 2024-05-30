@@ -35,6 +35,8 @@ public class SocketSender  {
 
     public int bufferSize = 8192;
 
+    private Map<String,String> tunnelConfig;
+
     public SocketSender(PluginBuilder plugin, SocketController socketController, Map<String,String> tunnelConfig)  {
         this.plugin = plugin;
         logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
@@ -50,6 +52,7 @@ public class SocketSender  {
             bufferSize = Integer.parseInt(tunnelConfig.get("buffer_size"));
             logger.error("custom buffer_size: " + bufferSize);
         }
+        this.tunnelConfig = tunnelConfig;
 
     }
 
@@ -303,10 +306,10 @@ public class SocketSender  {
                 //close remote
                 logger.error("controller:" + socketController.toString());
                 logger.error("sTunnelId: " + sTunnelId);
-                logger.error("socketController.getTunnelConfig(sTunnelId): " + socketController.getTunnelConfig(sTunnelId));
+                logger.error("socketController.getTunnelConfig(sTunnelId): " + tunnelConfig);
                 logger.error("plugin: " + plugin.toString());
 
-                Map<String, String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
+                //Map<String, String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
                 MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
                 request.setParam("action", "closesrcclient");
                 request.setParam("action_client_id", clientId);
@@ -314,7 +317,7 @@ public class SocketSender  {
                 if (response.getParam("status") != null) {
                     int status = Integer.parseInt(response.getParam("status"));
                     if (status == 10) {
-                        logger.info("(15) [dst] Src port confirmed closed.");
+                        logger.info("(16) [dst] Src port confirmed closed.");
                     } else {
                         logger.error("Error in closing src port: " + response.getParams());
                     }
