@@ -5,7 +5,7 @@ import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
-import javax.jms.*;
+import jakarta.jms.*;
 import java.io.*;
 import java.net.Socket;
 import java.util.Collections;
@@ -35,8 +35,6 @@ public class SocketSender  {
 
     public int bufferSize = 8192;
 
-    private Map<String,String> tunnelConfig;
-
     public SocketSender(PluginBuilder plugin, SocketController socketController, Map<String,String> tunnelConfig)  {
         this.plugin = plugin;
         logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
@@ -52,7 +50,6 @@ public class SocketSender  {
             bufferSize = Integer.parseInt(tunnelConfig.get("buffer_size"));
             logger.error("custom buffer_size: " + bufferSize);
         }
-        this.tunnelConfig = tunnelConfig;
 
     }
 
@@ -306,11 +303,11 @@ public class SocketSender  {
                 //close remote
                 logger.error("controller:" + socketController.toString());
                 logger.error("sTunnelId: " + sTunnelId);
-                logger.error("socketController.getTunnelConfig(sTunnelId): " + tunnelConfig);
+                logger.error("socketController.getTunnelConfig(sTunnelId): " + socketController.getTunnelConfig(sTunnelId));
                 logger.error("plugin: " + plugin.toString());
 
-                //Map<String, String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
-                MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("src_region"), tunnelConfig.get("src_agent"), tunnelConfig.get("src_plugin"));
+                Map<String, String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
+                MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
                 request.setParam("action", "closesrcclient");
                 request.setParam("action_client_id", clientId);
                 MsgEvent response = plugin.sendRPC(request);

@@ -8,10 +8,8 @@ import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
-import javax.jms.BytesMessage;
-import javax.jms.Message;
-import javax.jms.StreamMessage;
-import javax.jms.TextMessage;
+import jakarta.jms.*;
+
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Type;
@@ -422,7 +420,7 @@ public class ExecutorImpl implements Executor {
     }
     private void getlist(String queryString) {
 
-        javax.jms.MessageListener ml = new javax.jms.MessageListener() {
+        MessageListener ml = new MessageListener() {
             public void onMessage(Message msg) {
                 try {
 

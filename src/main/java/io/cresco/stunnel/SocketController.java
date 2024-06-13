@@ -7,10 +7,9 @@ import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
-import javax.jms.BytesMessage;
-import javax.jms.Message;
-import javax.jms.MessageListener;
-import javax.jms.TextMessage;
+
+import jakarta.jms.*;
+
 import java.lang.reflect.Type;
 import java.util.Collections;
 import java.util.HashMap;

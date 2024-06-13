@@ -6,7 +6,8 @@ import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
-import javax.jms.*;
+import jakarta.jms.*;
+
 import java.io.*;
 import java.net.*;
 import java.util.Collections;
