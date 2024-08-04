@@ -54,7 +54,6 @@ public class SocketListener implements Runnable  {
     }
 
 
-
     public void close() {
 
         if(isActive) {

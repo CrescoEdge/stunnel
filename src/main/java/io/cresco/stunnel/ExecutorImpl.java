@@ -121,9 +121,11 @@ public class ExecutorImpl implements Executor {
 
                 if(isSrcPortFree(srcPort)) {
                     logger.error("(1): local port is free");
-                    if(socketController.createSrcTunnel(srcPort, dstHost, dstPort, dstRegion, dstAgent, dstPlugin, bufferSize)) {
+                    String sTunnelId = socketController.createSrcTunnel(srcPort, dstHost, dstPort, dstRegion, dstAgent, dstPlugin, bufferSize);
+                    if(sTunnelId != null) {
                         incoming.setParam("status", "10");
                         incoming.setParam("status_desc", "tunnel created");
+                        incoming.setParam("stunnel_id", sTunnelId);
                     } else {
                         incoming.setParam("status", "9");
                         incoming.setParam("status_desc", "unable to create tunnel");

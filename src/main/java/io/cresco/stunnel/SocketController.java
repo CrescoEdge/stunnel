@@ -51,13 +51,11 @@ public class SocketController  {
         mapType = new TypeToken<Map<String, String>>(){}.getType();
     }
 
-    public boolean createSrcTunnel(int srcPort, String dstHost, int dstPort, String dstRegion, String dstAgent, String dstPlugin, int bufferSize) {
-        boolean isCreated = false;
+    public String createSrcTunnel(int srcPort, String dstHost, int dstPort, String dstRegion, String dstAgent, String dstPlugin, int bufferSize) {
+
+        String sTunnelId = UUID.randomUUID().toString();
 
         try{
-            //tunnel id,based on initial request
-            String sTunnelId = UUID.randomUUID().toString();
-
             //create config
             Map<String,String> tunnelConfig = new HashMap<>();
             tunnelConfig.put("stunnel_id", sTunnelId);
@@ -123,12 +121,14 @@ public class SocketController  {
             //start new listner thread
             new Thread(socketListener).start();
 
+
         } catch (Exception ex) {
+            sTunnelId = null;
             logger.error("Failed to create tunnel error: " + ex.getMessage());
             ex.printStackTrace();
         }
 
-        return isCreated;
+        return sTunnelId;
     }
 
     public void setTunnelStatus(String tunnelId, StatusType statusType) {
