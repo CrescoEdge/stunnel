@@ -48,6 +48,8 @@ public class ExecutorImpl implements Executor {
                     return createSrcTunnel(incoming);
                 case "configdsttunnel":
                     return createDstTunnel(incoming);
+                case "srcportcheck":
+                    return srcPortCheck(incoming);
                 case "dstportcheck":
                     return dstPortCheck(incoming);
                 case "closesrcclient":
@@ -196,6 +198,36 @@ public class ExecutorImpl implements Executor {
                 } else {
                     incoming.setParam("status", "9");
                     incoming.setParam("status_desc", "requested dst port already bound");
+                }
+
+            } else {
+                incoming.setParam("status", "8");
+                incoming.setParam("status_desc", "missing required parameter(s)");
+            }
+        } catch (Exception ex) {
+            incoming.setParam("status", "7");
+            incoming.setParam("status_desc", "error " + ex.getMessage());
+            ex.printStackTrace();
+        }
+        return incoming;
+    }
+
+    private MsgEvent srcPortCheck(MsgEvent incoming) {
+
+        //logger.info("dstPortCheck INCOMING: " + incoming.getParams());
+        try {
+
+            if (incoming.getParam("action_src_port") != null) {
+
+                int srcPort = Integer.parseInt(incoming.getParam("action_src_port"));
+                if(isSrcPortFree(srcPort)) {
+
+                    incoming.setParam("status", "10");
+                    incoming.setParam("status_desc", "src port is free");
+
+                } else {
+                    incoming.setParam("status", "9");
+                    incoming.setParam("status_desc", "requested src port already bound");
                 }
 
             } else {
