@@ -214,7 +214,6 @@ public class ExecutorImpl implements Executor {
 
             if (incoming.getParam("action_client_id") != null) {
 
-
                 boolean closeClient = socketController.socketListener.closeClient(incoming.getParam("action_client_id"));
                 if(closeClient) {
                     incoming.setParam("status", "10");

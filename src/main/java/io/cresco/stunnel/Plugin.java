@@ -26,9 +26,7 @@ public class Plugin implements PluginService {
     private Executor executor;
     private CLogger logger;
     private Map<String,Object> map;
-
     private SocketController socketController;
-
     @Activate
     void activate(BundleContext context, Map<String,Object> map) {
 

@@ -168,6 +168,14 @@ public class SocketController  {
 
     public Map<String,String> createDstTunnel(Map<String,String> tunnelConfig) {
 
+        String sTunnelId = tunnelConfig.get("stunnel_id");
+
+        //now set status to init
+        setTunnelStatus(sTunnelId,StatusType.INIT);
+
+        //set the tunnel config
+        setTunnelConfig(sTunnelId, tunnelConfig);
+
         try{
 
             socketSender = new SocketSender(plugin, this, tunnelConfig);

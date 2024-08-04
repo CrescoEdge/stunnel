@@ -308,7 +308,7 @@ public class SocketSender  {
 
                 Map<String, String> tunnelConfig = socketController.getTunnelConfig(sTunnelId);
                 MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
-                request.setParam("action", "closesrcclient");
+                request.setParam("action", "closedstclient");
                 request.setParam("action_client_id", clientId);
                 MsgEvent response = plugin.sendRPC(request);
                 if (response.getParam("status") != null) {
