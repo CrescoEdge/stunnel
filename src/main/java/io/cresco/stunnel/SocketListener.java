@@ -395,7 +395,6 @@ public class SocketListener implements Runnable  {
                     if (bytesRead == -1) {
                         logger.error("(13) src port closed by external");
                         connectionBroken();
-
                     }
 
                     if(bytesRead > 0) {
