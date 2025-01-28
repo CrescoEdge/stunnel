@@ -6,8 +6,11 @@ import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 import io.cresco.stunnel.state.SocketControllerSM;
-
+import com.google.gson.GsonBuilder;
+import java.io.*;
 import java.lang.reflect.Type;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.*;
 
 public class SocketController extends SocketControllerSM {
@@ -18,6 +21,7 @@ public class SocketController extends SocketControllerSM {
     public TunnelListener tunnelListener;
     public TunnelSender tunnelSender;
 
+    // Create a GsonBuilder and enable the pretty print
     private Gson gson;
     public Type mapType;
 
@@ -28,9 +32,55 @@ public class SocketController extends SocketControllerSM {
         this.plugin = plugin;
         logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
         mapType = new TypeToken<Map<String, String>>(){}.getType();
-        gson = new Gson();
+        gson = new GsonBuilder().setPrettyPrinting().create();
         // check local config for startup data
-        //checkStartUpConfig();
+        checkStartUpConfig();
+
+    }
+
+    private Map<String,String> getSavedTunnelConfig() {
+        Map<String,String> savedTunnelConfig = null;
+        try {
+            String configPath = plugin.getPluginDataDirectory() + "/tunnel_config.json";
+
+
+            File f = new File(configPath);
+            if(f.exists() && !f.isDirectory()) {
+                logger.info("Loading tunnel config: " + configPath);
+                try (BufferedReader reader = new BufferedReader(new FileReader(configPath))) {
+                    StringBuilder content = new StringBuilder();
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        content.append(line).append("\n");
+                    }
+
+                    Type type = new TypeToken<Map<String, String>>(){}.getType();
+                    savedTunnelConfig = gson.fromJson(content.toString(), type);
+
+                } catch (Exception e) {
+                    logger.error("Error loading saved tunnel config", e.getMessage());
+                }
+            }
+
+        } catch (Exception e) {
+            logger.error("Error getting saved tunnel config", e.getMessage());
+        }
+
+        return savedTunnelConfig;
+    }
+
+    private void saveTunnelConfig(Map<String,String> tunnelConfig) {
+        try {
+            String configPath = plugin.getPluginDataDirectory() + "/tunnel_config.json";
+            logger.info("Saving tunnel config: " + configPath);
+            Files.createDirectories(Paths.get(plugin.getPluginDataDirectory()));
+            String configJson = gson.toJson(tunnelConfig);
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(configPath))) {
+                writer.write(configJson);
+            }
+        } catch (Exception e) {
+            logger.error("Error saving tunnel config", e.getMessage());
+        }
     }
 
     private void checkStartUpConfig() {
@@ -40,39 +90,40 @@ public class SocketController extends SocketControllerSM {
 
                 logger.info("Checking startup config...");
 
-                // check if config contains everything we need
-                List<String> requiredConfigKeys = new ArrayList<>();
-                requiredConfigKeys.add("stunnel_id");
-                requiredConfigKeys.add("src_port");
-                requiredConfigKeys.add("dst_host");
-                requiredConfigKeys.add("dst_port");
-                requiredConfigKeys.add("dst_region");
-                requiredConfigKeys.add("dst_agent");
-                requiredConfigKeys.add("dst_plugin");
-                requiredConfigKeys.add("src_region");
-                requiredConfigKeys.add("src_agent");
-                requiredConfigKeys.add("src_plugin");
-                requiredConfigKeys.add("buffer_size");
-                requiredConfigKeys.add("watchdog_timeout");
+                Map<String,String> canidateConfig = getSavedTunnelConfig();
 
-                boolean goodConfig = true;
+                if (canidateConfig != null) {
 
-                Map<String, String> canidateConfig = new HashMap<>();
-                for (String key : requiredConfigKeys) {
-                    if (!plugin.getConfig().getConfigMap().containsKey(key)) {
-                        goodConfig = false;
-                    } else {
-                        canidateConfig.put(key,(String)plugin.getConfig().getConfigMap().get(key));
+                    // check if config contains everything we need
+                    List<String> requiredConfigKeys = new ArrayList<>();
+                    requiredConfigKeys.add("stunnel_id");
+                    requiredConfigKeys.add("src_port");
+                    requiredConfigKeys.add("dst_host");
+                    requiredConfigKeys.add("dst_port");
+                    requiredConfigKeys.add("dst_region");
+                    requiredConfigKeys.add("dst_agent");
+                    requiredConfigKeys.add("dst_plugin");
+                    requiredConfigKeys.add("src_region");
+                    requiredConfigKeys.add("src_agent");
+                    requiredConfigKeys.add("src_plugin");
+                    requiredConfigKeys.add("buffer_size");
+                    requiredConfigKeys.add("watchdog_timeout");
+
+                    boolean goodConfig = true;
+
+                    for (String key : requiredConfigKeys) {
+                        if(!canidateConfig.containsKey(key)) {
+                            goodConfig = false;
+                        }
                     }
 
-                }
-
-                if (goodConfig) {
-                    logger.info("Startup config ok...creating tunnel");
-                    String sTunnelId = null;
-                    while(sTunnelId == null) {
-                        logger.info("Waiting for Tunnel ID...");
-                        sTunnelId = createSrcTunnel(canidateConfig);
+                    if (goodConfig) {
+                        logger.info("Startup config ok...creating tunnel");
+                        String sTunnelId = null;
+                        while (sTunnelId == null) {
+                            logger.info("Waiting for Tunnel ID...");
+                            sTunnelId = createSrcTunnel(canidateConfig);
+                        }
                     }
                 }
 
@@ -191,8 +242,6 @@ public class SocketController extends SocketControllerSM {
 
             if(tunnelListener == null) {
 
-                // set the tunnel config
-                this.tunnelConfig = tunnelConfig;
                 sTunnelId = tunnelConfig.get("stunnel_id");
 
                 logger.debug("(2): send message to remote to create dst tunnel");
@@ -254,6 +303,10 @@ public class SocketController extends SocketControllerSM {
 
         if (sTunnelId != null) {
             this.completeTunnelListenerInit();
+            // set the tunnel config
+            this.tunnelConfig = tunnelConfig;
+            // save config to disk
+            saveTunnelConfig(tunnelConfig);
         } else {
             this.failedTunnelListenerInit();
         }
@@ -345,5 +398,4 @@ public class SocketController extends SocketControllerSM {
         removeSrcTunnel();
     }
 }
-
 
