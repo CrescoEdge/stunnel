@@ -2,125 +2,171 @@ package io.cresco.stunnel;
 
 import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
-import io.cresco.library.data.TopicType;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
-
-
-import jakarta.jms.*;
+import io.cresco.stunnel.state.SocketControllerSM;
 
 import java.lang.reflect.Type;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.*;
 
+public class SocketController extends SocketControllerSM {
 
-public class SocketController  {
+    private final PluginBuilder plugin;
+    private final CLogger logger;
 
-    private PluginBuilder plugin;
-    private CLogger logger;
+    public TunnelListener tunnelListener;
+    public TunnelSender tunnelSender;
 
-    private final AtomicBoolean tunnelConfigsLock;
-    private Map<String, Map<String,String>> tunnelConfigs;
-
-    private final AtomicBoolean tunnelStatusLock;
-    private Map<String, StatusType> tunnelStatus;
-
-    private final AtomicBoolean tunnelListenersLock;
-    private Map<String, SocketListener> tunnelListners;
-
-    public SocketListener socketListener;
-    public SocketSender socketSender;
     private Gson gson;
-
     public Type mapType;
 
-    public SocketController(PluginBuilder plugin)  {
+    private Map<String,String> tunnelConfig;
+
+
+    public SocketController(PluginBuilder plugin) {
         this.plugin = plugin;
         logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
-        tunnelConfigsLock = new AtomicBoolean();
-        tunnelConfigs = Collections.synchronizedMap(new HashMap<>());
-        tunnelStatusLock = new AtomicBoolean();
-        tunnelStatus = Collections.synchronizedMap(new HashMap<>());
-        tunnelListenersLock = new AtomicBoolean();
-        tunnelListners = Collections.synchronizedMap(new HashMap<>());
-        gson = new Gson();
         mapType = new TypeToken<Map<String, String>>(){}.getType();
+        gson = new Gson();
+        // check local config for startup data
+        //checkStartUpConfig();
     }
 
-    public String createSrcTunnel(int srcPort, String dstHost, int dstPort, String dstRegion, String dstAgent, String dstPlugin, int bufferSize) {
+    private void checkStartUpConfig() {
+
+        new Thread(() -> {
+            try {
+
+                logger.info("Checking startup config...");
+
+                // check if config contains everything we need
+                List<String> requiredConfigKeys = new ArrayList<>();
+                requiredConfigKeys.add("stunnel_id");
+                requiredConfigKeys.add("src_port");
+                requiredConfigKeys.add("dst_host");
+                requiredConfigKeys.add("dst_port");
+                requiredConfigKeys.add("dst_region");
+                requiredConfigKeys.add("dst_agent");
+                requiredConfigKeys.add("dst_plugin");
+                requiredConfigKeys.add("src_region");
+                requiredConfigKeys.add("src_agent");
+                requiredConfigKeys.add("src_plugin");
+                requiredConfigKeys.add("buffer_size");
+                requiredConfigKeys.add("watchdog_timeout");
+
+                boolean goodConfig = true;
+
+                Map<String, String> canidateConfig = new HashMap<>();
+                for (String key : requiredConfigKeys) {
+                    if (!plugin.getConfig().getConfigMap().containsKey(key)) {
+                        goodConfig = false;
+                    } else {
+                        canidateConfig.put(key,(String)plugin.getConfig().getConfigMap().get(key));
+                    }
+
+                }
+
+                if (goodConfig) {
+                    logger.info("Startup config ok...creating tunnel");
+                    String sTunnelId = null;
+                    while(sTunnelId == null) {
+                        logger.info("Waiting for Tunnel ID...");
+                        sTunnelId = createSrcTunnel(canidateConfig);
+                    }
+                }
+
+            } catch(Exception v) {
+                System.out.println(v);
+            }
+        }).start();
+
+    }
+
+    public boolean stateNotify(String node) {
+        if(logger != null) {
+            logger.info("SocketController stateNotify: " + node);
+        }
+
+        State state = State.valueOf(node);
+
+        switch(state)
+        {
+            case pluginActive:
+                // line 5 "model.ump"
+                break;
+            case initTunnelListener:
+                // line 16 "model.ump"
+                break;
+            case activeTunnelListener:
+                // line 24 "model.ump"
+                break;
+            case tunnelListenerRecovery:
+                // line 32 "model.ump"
+                // save config
+                Map<String,String> savedTunnelConfig = new HashMap<>(this.tunnelConfig);
+                // clear out src tunnel
+                removeSrcTunnel();
+                String sTunnelId = null;
+                while(sTunnelId == null) {
+                    sTunnelId = createSrcTunnel(savedTunnelConfig);
+                }
+                // notify that things have recovered
+                recoveredTunnel();
+                break;
+            case errorTunnelListener:
+                // line 39 "model.ump"
+                break;
+            case initTunnelSender:
+                // line 48 "model.ump"
+                break;
+            case activeTunnelSender:
+                // line 55 "model.ump"
+                break;
+            case errorTunnelSender:
+                // line 62 "model.ump"
+                break;
+            case pluginShutdown:
+                // line 68 "model.ump"
+                break;
+        }
+
+        return true;
+    }
+
+
+    public String createSrcTunnel(int srcPort, String dstHost, int dstPort, String dstRegion, String dstAgent, String dstPlugin, int bufferSize, int watchDogTimeout) {
+        // set state
+        this.incomingSrcTunnelConfig();
 
         String sTunnelId = UUID.randomUUID().toString();
 
         try{
-            //create config
-            Map<String,String> tunnelConfig = new HashMap<>();
-            tunnelConfig.put("stunnel_id", sTunnelId);
-            tunnelConfig.put("src_port", String.valueOf(srcPort));
-            tunnelConfig.put("dst_host", dstHost);
-            tunnelConfig.put("dst_port", String.valueOf(dstPort));
-            tunnelConfig.put("dst_region", dstRegion);
-            tunnelConfig.put("dst_agent", dstAgent);
-            tunnelConfig.put("dst_plugin", dstPlugin);
-            tunnelConfig.put("src_region", plugin.getRegion());
-            tunnelConfig.put("src_agent", plugin.getAgent());
-            tunnelConfig.put("src_plugin", plugin.getPluginID());
-            tunnelConfig.put("buffer_size", String.valueOf(bufferSize));
 
-            logger.error("(2): [REMOVED] send message to remote plugin and check if dst host/port is listening");
-            //send message to remote plugin and check if dst host/port is listening
-            /*
-            MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, dstRegion, dstAgent, dstPlugin);
-            request.setParam("action", "dstportcheck");
-            request.setParam("action_dst_host", dstHost);
-            request.setParam("action_dst_port", String.valueOf(dstPort));
-            MsgEvent response = plugin.sendRPC(request);
+            if(tunnelListener == null) {
 
-            int dstPortStatus = - 1;
-            if(response.paramsContains("status")) {
-                dstPortStatus = Integer.parseInt(response.getParam("status"));
-            }
+                //create config
+                Map<String, String> tunnelConfig = new HashMap<>();
+                tunnelConfig.put("stunnel_id", sTunnelId);
+                tunnelConfig.put("src_port", String.valueOf(srcPort));
+                tunnelConfig.put("dst_host", dstHost);
+                tunnelConfig.put("dst_port", String.valueOf(dstPort));
+                tunnelConfig.put("dst_region", dstRegion);
+                tunnelConfig.put("dst_agent", dstAgent);
+                tunnelConfig.put("dst_plugin", dstPlugin);
+                tunnelConfig.put("src_region", plugin.getRegion());
+                tunnelConfig.put("src_agent", plugin.getAgent());
+                tunnelConfig.put("src_plugin", plugin.getPluginID());
+                tunnelConfig.put("buffer_size", String.valueOf(bufferSize));
+                tunnelConfig.put("watchdog_timeout", String.valueOf(watchDogTimeout));
 
-            //if dst host/port is listening = 10, move forward
-            if(dstPortStatus == 10) {
-
-                //now set status to init
-                setTunnelStatus(sTunnelId,StatusType.INIT);
-
-                //set the tunnel config
-                setTunnelConfig(sTunnelId, tunnelConfig);
-
-                logger.error("(3): remote port is listening, start SocketListener()");
-                //create listener
-                socketListener = new SocketListener(plugin, this, sTunnelId, srcPort);
-                //start new listner thread
-                //logger.error("STARTING THREAD FOR LISTENER");
-                new Thread(socketListener).start();
-
+                // create from map
+                return createSrcTunnel(tunnelConfig);
 
             } else {
-                //tear down things broke
-                logger.error("Failed to create tunnel error: Remote dstTunnel config failed.");
+                sTunnelId = null;
+                logger.error("tunnelListener exists, plugin is already configured!");
             }
-
-             */
-
-            //now set status to init
-            setTunnelStatus(sTunnelId,StatusType.INIT);
-
-            //set the tunnel config
-            setTunnelConfig(sTunnelId, tunnelConfig);
-
-            logger.error("(3): remote port is listening, start SocketListener()");
-            //create listener
-            socketListener = new SocketListener(plugin, this, sTunnelId, srcPort, bufferSize);
-
-            //start new listner thread
-            new Thread(socketListener).start();
-
 
         } catch (Exception ex) {
             sTunnelId = null;
@@ -128,104 +174,175 @@ public class SocketController  {
             ex.printStackTrace();
         }
 
+        if (sTunnelId != null) {
+            this.completeTunnelListenerInit();
+        } else {
+            this.failedTunnelListenerInit();
+        }
+
         return sTunnelId;
     }
 
-    public void setTunnelStatus(String tunnelId, StatusType statusType) {
+    public String createSrcTunnel(Map<String, String> tunnelConfig) {
 
-        synchronized (tunnelStatusLock) {
-            tunnelStatus.put(tunnelId,statusType);
-        }
-
-    }
-    public StatusType getTunnelStatus(String tunnelId) {
-
-        StatusType statusType;
-
-        synchronized (tunnelStatusLock) {
-            statusType = tunnelStatus.get(tunnelId);
-        }
-        return statusType;
-    }
-
-    public void setTunnelConfig(String tunnelId, Map<String,String> tunnelConfig) {
-
-        synchronized (tunnelConfigsLock) {
-            tunnelConfigs.put(tunnelId, tunnelConfig);
-        }
-
-    }
-
-    public Map<String,String> getTunnelConfig(String tunnelId) {
-
-        Map<String,String> tunnelConfig;
-
-        synchronized (tunnelConfigsLock) {
-            tunnelConfig = tunnelConfigs.get(tunnelId);
-        }
-        return tunnelConfig;
-    }
-
-    public Map<String,String> createDstTunnel(Map<String,String> tunnelConfig) {
-
-        String sTunnelId = tunnelConfig.get("stunnel_id");
-
-        //now set status to init
-        setTunnelStatus(sTunnelId,StatusType.INIT);
-
-        //set the tunnel config
-        setTunnelConfig(sTunnelId, tunnelConfig);
+        String sTunnelId = null;
 
         try{
 
-            socketSender = new SocketSender(plugin, this, tunnelConfig);
-            if(!socketSender.start()) {
-                tunnelConfig = null;
-                logger.error("Unable to start socketSender.");
+            if(tunnelListener == null) {
+
+                // set the tunnel config
+                this.tunnelConfig = tunnelConfig;
+                sTunnelId = tunnelConfig.get("stunnel_id");
+
+                logger.debug("(2): send message to remote to create dst tunnel");
+
+                MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
+                request.setParam("action", "configdsttunnel");
+                request.setParam("action_tunnel_config", gson.toJson(tunnelConfig));
+                MsgEvent response = plugin.sendRPC(request);
+
+                if (response.getParam("status") != null) {
+                    int status = Integer.parseInt(response.getParam("status"));
+                    if (status == 10) {
+                        try {
+                            logger.debug("(2): TunnelSender started, starting TunnelListener()");
+
+                            //create listener
+                            tunnelListener = new TunnelListener(plugin, this, tunnelConfig);
+
+                            //start new listner thread
+                            new Thread(tunnelListener).start();
+
+                            while(!tunnelListener.isInit()) {
+                                Thread.sleep(100);
+                            }
+
+                            if (!tunnelListener.isActive()) {
+                                sTunnelId = null;
+                                logger.error("(2): TunnelListener -> start failed");
+                                tunnelListener.closeSocket();
+                                tunnelListener.close();
+                                tunnelListener = null;
+
+                            }
+
+                        } catch (Exception ex) {
+                            sTunnelId = null;
+                            logger.error("(2): TunnelListener -> create failed: " + ex.getMessage());
+                        }
+
+                    } else {
+                        sTunnelId = null;
+                        logger.error("(2): TunnelListener: Error in remote config of TunnelSender: " + response.getParams());
+                    }
+                } else {
+                    sTunnelId = null;
+                    logger.error("(2): TunnelSender: Error in remote response of TunnelSender config: Missing status from response: " + response.getParams());
+                }
+
+            } else {
+                sTunnelId = null;
+                logger.error("tunnelListener exists, plugin is already configured!");
             }
 
         } catch (Exception ex) {
+            sTunnelId = null;
+            logger.error("Failed to create tunnel error: " + ex.getMessage());
+            ex.printStackTrace();
+        }
+
+        if (sTunnelId != null) {
+            this.completeTunnelListenerInit();
+        } else {
+            this.failedTunnelListenerInit();
+        }
+
+        return sTunnelId;
+    }
+
+    private void removeSrcTunnel() {
+        if(tunnelListener != null) {
+            tunnelListener.close();
+            tunnelListener = null;
+        }
+        tunnelConfig = null;
+    }
+
+    public Map<String,String> createDstTunnel(Map<String,String> tunnelConfig) {
+        // set state
+        this.incomingDstTunnelConfig();
+
+        this.tunnelConfig = tunnelConfig;
+
+        //String sTunnelId = tunnelConfig.get("stunnel_id");
+
+        //now set status to init
+        //setTunnelStatus(sTunnelId, StatusType.INIT);
+
+        //set the tunnel config
+        //setTunnelConfig(sTunnelId, tunnelConfig);
+
+
+        try{
+            if(tunnelSender == null) {
+                //logger.error("I JUST CREATED A NEW TUNNEL SENDER!!!!");
+                tunnelSender = new TunnelSender(plugin, this, tunnelConfig);
+            } else {
+                logger.error("tunnelSender is already set, this plugin is already configured!");
+            }
+
+        } catch (Exception ex) {
+            // set state
+            // this.failedSocketSenderInit();
             logger.error("Unable to createDstTunnel: " + ex.getMessage());
             logger.error("tunnelConfig: " + tunnelConfig);
             tunnelConfig = null;
             ex.printStackTrace();
         }
 
+        if (tunnelConfig != null) {
+            this.completeTunnelSenderInit();
+        } else {
+            this.failedTunnelSenderInit();
+        }
         return tunnelConfig;
     }
 
-    public void shutdown() {
-        if(socketListener != null) {
-            socketListener.close();
+    public void removeDstTunnel() {
+        if(tunnelSender != null) {
+            tunnelSender.close();
+            tunnelSender = null;
         }
-        if(socketSender != null) {
-            socketSender.close();
-        }
+
+        tunnelConfig = null;
     }
-    private String getControlDBListener(String sTunnelId, String stype, String direction) {
 
-        MessageListener ml = new MessageListener() {
-            public void onMessage(Message msg) {
-                try {
+    public boolean createDstSession(String tunnelId, String clientId) {
 
-                    if (msg instanceof TextMessage) {
-                        logger.error("CONTROLLER MESSAGE: " + ((TextMessage) msg).getText());
-                    }
+        boolean isStarted = false;
 
-                } catch(Exception ex) {
-                    ex.printStackTrace();
-                }
+        try{
+            logger.debug("Trying to create new dst session: tunnelId=" + tunnelId + ", clientId=" + clientId);
+            if(tunnelSender != null) {
+                isStarted = tunnelSender.createSession(clientId);
+            } else {
+                logger.error("tunnelSender is null, is it configured?");
             }
-        };
 
+        } catch (Exception ex) {
+            // set state
+            // this.failedSocketSenderInit();
+            logger.error("Unable to createDstSession: " + ex.getMessage());
+            ex.printStackTrace();
+        }
 
-        String queryString = "stunnel_name='" + sTunnelId + "' and stype='" + stype + "' and direction='" + direction + "'";
-        return plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL,ml,queryString);
-
+        return isStarted;
     }
 
-    public enum StatusType {
-        INIT, READY, ACTIVE, CLOSED
+    public void shutdown() {
+        removeDstTunnel();
+        removeSrcTunnel();
     }
 }
 

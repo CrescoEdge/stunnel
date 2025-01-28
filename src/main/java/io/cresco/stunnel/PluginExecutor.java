@@ -1,37 +1,27 @@
 package io.cresco.stunnel;
 
-import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
-import io.cresco.library.data.TopicType;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
-import jakarta.jms.*;
-
-import java.io.File;
 import java.io.IOException;
-import java.lang.reflect.Type;
 import java.net.*;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.*;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.Map;
 
-public class ExecutorImpl implements Executor {
+public class PluginExecutor implements Executor {
 
-    private PluginBuilder plugin;
-    private CLogger logger;
-    private Gson gson;
+    private final PluginBuilder plugin;
+    private final CLogger logger;
+    private final Gson gson;
 
 
-    private SocketController socketController;
+    private final SocketController socketController;
 
-    public ExecutorImpl(PluginBuilder pluginBuilder, SocketController socketController) {
+    public PluginExecutor(PluginBuilder pluginBuilder, SocketController socketController) {
         this.plugin = pluginBuilder;
-        logger = plugin.getLogger(ExecutorImpl.class.getName(), CLogger.Level.Info);
+        logger = plugin.getLogger(PluginExecutor.class.getName(), CLogger.Level.Info);
         this.socketController = socketController;
         gson = new Gson();
 
@@ -48,6 +38,8 @@ public class ExecutorImpl implements Executor {
                     return createSrcTunnel(incoming);
                 case "configdsttunnel":
                     return createDstTunnel(incoming);
+                case "configdstsession":
+                    return createDstSession(incoming);
                 case "srcportcheck":
                     return srcPortCheck(incoming);
                 case "dstportcheck":
@@ -81,6 +73,9 @@ public class ExecutorImpl implements Executor {
         if(incoming.getParams().containsKey("action")) {
             switch (incoming.getParam("action")) {
 
+                case "tunnelhealthcheck":
+                    return tunnelHealthCheck(incoming);
+
                 default:
                     logger.error("Unknown configtype found {} for {}:", incoming.getParam("action"), incoming.getMsgType().toString());
                     logger.error(incoming.getParams().toString());
@@ -91,17 +86,16 @@ public class ExecutorImpl implements Executor {
         return null;
 
     }
-
     @Override
     public MsgEvent executeWATCHDOG(MsgEvent incoming) { return null; }
-
     @Override
     public MsgEvent executeKPI(MsgEvent incoming) { return null; }
-
 
     private MsgEvent createSrcTunnel(MsgEvent incoming) {
 
         logger.debug("createSrcTunnel INCOMING: " + incoming.getParams());
+        // set state
+
         try {
 
             if ((incoming.getParam("action_src_port") != null) && (incoming.getParam("action_dst_host") != null) &&
@@ -115,29 +109,38 @@ public class ExecutorImpl implements Executor {
                 String dstAgent = incoming.getParam("action_dst_agent");
                 String dstPlugin = incoming.getParam("action_dst_plugin");
                 int bufferSize = 8192;
-                if(incoming.getParam("action_dst_agent") != null) {
+                int watchDogTimeout = 5000;
+                if(incoming.getParam("action_buffer_size") != null) {
                     bufferSize = Integer.parseInt(incoming.getParam("action_buffer_size"));
-                    logger.error("custom buffer_size: " + bufferSize);
+                    logger.debug("custom buffer_size: " + bufferSize);
+                }
+                if(incoming.getParam("action_watchdog_timeout") != null) {
+                    bufferSize = Integer.parseInt(incoming.getParam("action_watchdog_timeout"));
+                    logger.debug("custom watchdog timeout: " + watchDogTimeout);
                 }
 
-
                 if(isSrcPortFree(srcPort)) {
+
                     logger.error("(1): local port is free");
-                    String sTunnelId = socketController.createSrcTunnel(srcPort, dstHost, dstPort, dstRegion, dstAgent, dstPlugin, bufferSize);
+                    String sTunnelId = socketController.createSrcTunnel(srcPort, dstHost, dstPort, dstRegion, dstAgent, dstPlugin, bufferSize, watchDogTimeout);
                     if(sTunnelId != null) {
+                        // set state
                         incoming.setParam("status", "10");
                         incoming.setParam("status_desc", "tunnel created");
                         incoming.setParam("stunnel_id", sTunnelId);
                     } else {
+                        // set state
                         incoming.setParam("status", "9");
                         incoming.setParam("status_desc", "unable to create tunnel");
                     }
                 } else {
+                    //set state
                     incoming.setParam("status", "9");
                     incoming.setParam("status_desc", "requested src port already bound");
                 }
 
             } else {
+                // set state
                 incoming.setParam("status", "8");
                 incoming.setParam("status_desc", "missing required parameter(s)");
             }
@@ -157,23 +160,66 @@ public class ExecutorImpl implements Executor {
             if (incoming.getParam("action_tunnel_config") != null) {
 
                 Map<String,String> tunnelConfig = gson.fromJson(incoming.getParam("action_tunnel_config"),socketController.mapType);
+                String dstHost = tunnelConfig.get("dst_host");
+                int dstPort = Integer.parseInt(tunnelConfig.get("dst_port"));
 
-                tunnelConfig = socketController.createDstTunnel(tunnelConfig);
-                if(tunnelConfig != null) {
-                    incoming.setParam("action_tunnel_config",gson.toJson(tunnelConfig));
-                    incoming.setParam("status", "10");
-                    incoming.setParam("status_desc", "dst tunnel config created");
+                //if(isDstPortListening(dstHost, dstPort)) {
+
+                    tunnelConfig = socketController.createDstTunnel(tunnelConfig);
+
+                    if (tunnelConfig != null) {
+                        incoming.setParam("action_tunnel_config", gson.toJson(tunnelConfig));
+                        incoming.setParam("status", "10");
+                        incoming.setParam("status_desc", "dst tunnel config created");
+                    } else {
+                        incoming.setParam("status", "9");
+                        incoming.setParam("status_desc", "unable to create dst tunnel config");
+                    }
+                /*
                 } else {
-                    incoming.setParam("status", "9");
-                    incoming.setParam("status_desc", "unable to create dst tunnel config");
+                    incoming.setParam("status", "8");
+                    incoming.setParam("status_desc", "isDstPortListening == false");
                 }
 
+                 */
             } else {
-                incoming.setParam("status", "8");
+                incoming.setParam("status", "7");
                 incoming.setParam("status_desc", "missing required parameter(s)");
             }
         } catch (Exception ex) {
-            incoming.setParam("status", "7");
+            incoming.setParam("status", "6");
+            incoming.setParam("status_desc", "error " + ex.getMessage());
+            ex.printStackTrace();
+        }
+        return incoming;
+    }
+
+    private MsgEvent createDstSession(MsgEvent incoming) {
+
+        //logger.info("createDstTunnel INCOMING: " + incoming.getParams());
+        try {
+
+            if ((incoming.getParam("action_tunnel_id") != null) && (incoming.getParam("action_client_id") != null)) {
+
+                String tunnelId = incoming.getParam("action_tunnel_id");
+                String clientId = incoming.getParam("action_client_id");
+
+                boolean createdSession = socketController.createDstSession(tunnelId, clientId);
+
+                if (createdSession) {
+                    incoming.setParam("status", "10");
+                    incoming.setParam("status_desc", "dst session created");
+                } else {
+                    incoming.setParam("status", "9");
+                    incoming.setParam("status_desc", "unable to create dst session");
+                }
+
+            } else {
+                incoming.setParam("status", "7");
+                incoming.setParam("status_desc", "missing required parameter(s)");
+            }
+        } catch (Exception ex) {
+            incoming.setParam("status", "6");
             incoming.setParam("status_desc", "error " + ex.getMessage());
             ex.printStackTrace();
         }
@@ -248,7 +294,7 @@ public class ExecutorImpl implements Executor {
 
             if (incoming.getParam("action_client_id") != null) {
 
-                boolean closeClient = socketController.socketListener.closeClient(incoming.getParam("action_client_id"));
+                boolean closeClient = socketController.tunnelListener.closeClient(incoming.getParam("action_client_id"));
                 if(closeClient) {
                     incoming.setParam("status", "10");
                     incoming.setParam("status_desc", "dst tunnel config created");
@@ -276,7 +322,7 @@ public class ExecutorImpl implements Executor {
             if (incoming.getParam("action_client_id") != null) {
 
 
-                boolean closeClient = socketController.socketSender.closeClient(incoming.getParam("action_client_id"));
+                boolean closeClient = socketController.tunnelSender.closeClient(incoming.getParam("action_client_id"));
                 if(closeClient) {
                     incoming.setParam("status", "10");
                     incoming.setParam("status_desc", "dst tunnel config created");
@@ -297,35 +343,31 @@ public class ExecutorImpl implements Executor {
         return incoming;
     }
 
-
     private boolean isSrcPortFree(int port) {
-
 
         boolean isFree = false;
 
-        while (!isFree) {
-            ServerSocket ss = null;
-            DatagramSocket ds = null;
-            try {
-                ss = new ServerSocket(port);
-                ss.setReuseAddress(true);
-                ds = new DatagramSocket(port);
-                ds.setReuseAddress(true);
-                isFree = true;
+        ServerSocket ss = null;
+        DatagramSocket ds = null;
+        try {
+            ss = new ServerSocket(port);
+            ss.setReuseAddress(true);
+            ds = new DatagramSocket(port);
+            ds.setReuseAddress(true);
+            isFree = true;
 
 
-            } catch (IOException e) {
-            } finally {
-                if (ds != null) {
-                    ds.close();
-                }
+        } catch (IOException ignored) {
+        } finally {
+            if (ds != null) {
+                ds.close();
+            }
 
-                if (ss != null) {
-                    try {
-                        ss.close();
-                    } catch (IOException e) {
-                        /* should not be thrown */
-                    }
+            if (ss != null) {
+                try {
+                    ss.close();
+                } catch (IOException e) {
+                    /* should not be thrown */
                 }
             }
         }
@@ -348,7 +390,7 @@ public class ExecutorImpl implements Executor {
         } catch (IOException e) {
             if ( e.getMessage().equals("Connection refused")) {
                 reason = "port " + port + " on " + node + " is closed.";
-            };
+            }
             if ( e instanceof UnknownHostException ) {
                 reason = "node " + node + " is unresolved.";
             }
@@ -373,127 +415,18 @@ public class ExecutorImpl implements Executor {
         return isListening;
     }
 
-    public MsgEvent test(MsgEvent incoming) {
+    public MsgEvent tunnelHealthCheck(MsgEvent incoming) {
 
         try {
 
-            String stunnelId = incoming.getParam("action_stunnel_id");
-            logger.info("INCOMING TEST REQUEST: sTunnelId:" + stunnelId);
+            //String stunnelId = incoming.getParam("action_stunnel_id");
+            incoming.setParam("status", "10");
+            incoming.setParam("status_desc", "tunnel health check ok.");
 
-            TextMessage updateMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
-            updateMessage.setText("SENDING TEST MESSAGE");
-            updateMessage.setStringProperty("filerepo_name", stunnelId);
-            updateMessage.setStringProperty("region_id", plugin.getRegion());
-            updateMessage.setStringProperty("agent_id", plugin.getAgent());
-            updateMessage.setStringProperty("plugin_id", plugin.getPluginID());
-            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, updateMessage);
-            logger.info("OUTGOING TEST MESSAGE");
         } catch (Exception ex) {
             ex.printStackTrace();
         }
         return incoming;
-    }
-    private MsgEvent listenSrc(MsgEvent incoming) {
-
-        logger.info("listenSrc INCOMING: " + incoming);
-        try {
-
-            if ((incoming.getParam("action_stunnel_id") != null) && (incoming.getParam("action_stunnel_listen_port") != null)) {
-                String sTunnelId = incoming.getParam("action_stunnel_id");
-                int listenPort = Integer.parseInt(incoming.getParam("action_stunnel_listen_port"));
-                //socketListener = new SocketListener(plugin, sTunnelId, listenPort);
-                logger.info("listenSrc PRE-START");
-                //new Thread(socketListener).start();
-                logger.info("listenSrc POST-START");
-                logger.info("listenSrc Started new listener");
-
-            } else {
-                incoming.setParam("status", "8");
-                incoming.setParam("status_desc", "no stunnel_id or stunnel_listen_port parameter");
-            }
-        } catch (Exception ex) {
-            incoming.setParam("status", "7");
-            incoming.setParam("status_desc", "getFile error " + ex.getMessage());
-            ex.printStackTrace();
-        }
-        return incoming;
-    }
-    private MsgEvent listenDst(MsgEvent incoming) {
-
-        logger.info("listenDst INCOMING: " + incoming);
-        try {
-
-            if ((incoming.getParam("action_stunnel_id") != null) && (incoming.getParam("action_stunnel_dst_port") != null) && (incoming.getParam("action_stunnel_dst_host") != null)) {
-                String sTunnelId = incoming.getParam("action_stunnel_id");
-                String sTunnelHost = incoming.getParam("action_stunnel_dst_host");
-                int sTunnelDstPort = Integer.parseInt(incoming.getParam("action_stunnel_dst_port"));
-                logger.info("listenDst PRE-START");
-                //socketSender = new SocketSender(plugin, sTunnelId, sTunnelHost, sTunnelDstPort);
-                //socketSender.listenDP();
-                //socketSender.go();
-                /*
-                String sq = "t0-t0-t0-t0-t0";
-                String queryString = "stunnel_name='" + sq + "'";
-                getlist(queryString);
-                */
-
-                logger.info("listenDst POST-START");
-                logger.info("listenDst Started new listener");
-
-            } else {
-                incoming.setParam("status", "8");
-                incoming.setParam("status_desc", "no stunnel_id or stunnel_listen_port parameter");
-            }
-        } catch (Exception ex) {
-            incoming.setParam("status", "7");
-            incoming.setParam("status_desc", "getFile error " + ex.getMessage());
-            ex.printStackTrace();
-        }
-        return incoming;
-    }
-    private void getlist(String queryString) {
-
-        MessageListener ml = new MessageListener() {
-            public void onMessage(Message msg) {
-                try {
-
-                    if (msg instanceof BytesMessage) {
-                        logger.info("WE GOT SOMETHING BYTES");
-                        logger.info("querystring: " + queryString);
-                        logger.info("stunnel: " + msg.getStringProperty("stunnel_name"));
-                        Enumeration<?> prop_enum;
-                        prop_enum = msg.getPropertyNames();
-                        String prop;
-                        while (prop_enum.hasMoreElements()) {
-                            prop = (String) prop_enum.nextElement();
-                            logger.info(prop);
-                        }
-
-                    }
-
-                    if (msg instanceof StreamMessage) {
-                        logger.info("WE GOT SOMETHING Stream");
-                        logger.info("stunnel: " + msg.getStringProperty("stunnel_name"));
-                    }
-
-                    if (msg instanceof TextMessage) {
-                        logger.info("WE GOT SOMETHING TEXT");
-                        logger.info("stunnel: " + msg.getStringProperty("stunnel_name"));
-
-                    }
-                } catch(Exception ex) {
-
-                    ex.printStackTrace();
-                }
-            }
-        };
-
-        //String queryString = "stunnel_name='" + sTunnelId + "' AND broadcast";
-        //String queryString = "stunnel_name='" + "t0-t0-t0-t0-t0" + "'";
-
-        String node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL,ml,queryString);
-        logger.info("listenDP Listner: " + node_from_listner_id + " querystring:" + queryString);
-
     }
 
 }

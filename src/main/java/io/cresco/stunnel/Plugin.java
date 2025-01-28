@@ -77,7 +77,7 @@ public class Plugin implements PluginService {
                 this.socketController = new SocketController(pluginBuilder);
 
                 //Starting custom message handler
-                this.executor = new ExecutorImpl(pluginBuilder, socketController);
+                this.executor = new PluginExecutor(pluginBuilder, socketController);
                 pluginBuilder.setExecutor(executor);
 
                 while (!pluginBuilder.getAgentService().getAgentState().isActive()) {

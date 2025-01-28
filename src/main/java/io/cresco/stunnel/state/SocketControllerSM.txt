@@ -1,0 +1,73 @@
+class SocketControllerSM {
+  state {
+    pluginActive {
+      entry / {
+        stateNotify("pluginActive");
+      };
+      incomingSrcTunnelConfig -> initTunnelListener;
+      incomingDstTunnelConfig -> initTunnelSender;
+      startShutdown -> pluginShutdown;
+    }
+
+    // src
+    // 3 init tunnel listener
+    initTunnelListener {
+      entry / {
+        stateNotify("initTunnelListener");
+      };
+      completeTunnelListenerInit -> activeTunnelListener;
+      failedTunnelListenerInit -> pluginActive;
+    }
+    // 4 listening for incoming requests
+    activeTunnelListener {
+      entry / {
+        stateNotify("activeTunnelListener");
+      };
+      srcFailure -> errorTunnelListener;
+      startShutdown -> pluginShutdown;
+      dstCommFailure -> tunnelListenerRecovery;
+    }
+    tunnelListenerRecovery {
+      entry / {
+        stateNotify("tunnelListenerRecovery");
+      };
+      recoveredTunnel -> activeTunnelListener;
+      failedRecoveredTunnel -> errorTunnelListener;
+    }
+    errorTunnelListener {
+      entry / {
+        stateNotify("errorTunnelListener");
+      };
+      startShutdown -> pluginShutdown;
+    }
+
+    //dst
+    // tunnel sender
+    initTunnelSender {
+      entry / {
+        stateNotify("initTunnelSender");
+      };
+      completeTunnelSenderInit -> activeTunnelSender;
+      failedTunnelSenderInit -> pluginActive;
+    }
+    activeTunnelSender {
+      entry / {
+        stateNotify("activeTunnelSender");
+      };
+      dstFailure -> errorTunnelSender;
+      startShutdown -> pluginShutdown;
+    }
+    errorTunnelSender {
+      entry / {
+        stateNotify("errorTunnelSender");
+      };
+      startShutdown -> pluginShutdown;
+    }
+    pluginShutdown {
+      entry / {
+        stateNotify("pluginShutdown");
+      };
+    }
+  }
+  boolean stateNotify(String node) {return true;}
+}
