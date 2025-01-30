@@ -205,11 +205,10 @@ class SessionSender extends SessionSenderSM {
                             if(inForwardingActive.get()) {
                                 mOutputStream.write(buffer, 0, bytesRead);
                                 mOutputStream.flush();
+
+                                // record transfer metrics
+                                tunnelSender.bytes.addAndGet(bytesRead);
                             }
-                            //} else {
-                            //    logger.error("mServerSocket not connected state: " + mParent.getState());
-                            //}
-                            //logger.error("bufferSize length: " + buffer.length + " bytesRead: " + bytesRead + " body length:" + ((BytesMessage) msg).getBodyLength());
 
                         } else if (msg instanceof MapMessage) {
                             MapMessage statusMessage = (MapMessage) msg;

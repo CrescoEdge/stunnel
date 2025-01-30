@@ -1,13 +1,18 @@
 package io.cresco.stunnel;
 
+import io.cresco.library.data.TopicType;
 import io.cresco.library.messaging.MsgEvent;
+import io.cresco.library.metrics.MeasurementEngine;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
+import io.micrometer.core.instrument.DistributionSummary;
+import jakarta.jms.TextMessage;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 //https://www.nakov.com/books/inetjava/source-code-html/Chapter-1-Sockets/1.4-TCP-Sockets/TCPForwardServer.java.html
 
@@ -27,6 +32,12 @@ public class TunnelSender {
 
     private boolean inHealthCheck = false;
 
+    private DistributionSummary bytesPerSecond;
+    private final Timer performanceReporterTask;
+
+    public AtomicLong bytes = new AtomicLong(0);
+    private long lastReportTS = 0;
+
     public TunnelSender(PluginBuilder plugin, SocketController socketController, Map<String,String> tunnelConfig)  {
         this.plugin = plugin;
         logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
@@ -36,10 +47,67 @@ public class TunnelSender {
         sessionSenderLock = new AtomicBoolean();
         sessionSenders = Collections.synchronizedMap(new HashMap<>());
 
-        int watchDogTimeout = Integer.parseInt(tunnelConfig.get("watchdog_timeout"));
+        //report speed
+        initPerformanceMetrics();
+
+        int watchDogTimeout = 5000;
+        if(tunnelConfig.containsKey("watchdog_timeout")) {
+            watchDogTimeout = Integer.parseInt(tunnelConfig.get("watchdog_timeout"));
+        }
         senderHealthWatcherTask = new Timer();
         senderHealthWatcherTask.scheduleAtFixedRate(new SenderHealthWatcherTask(), 5000, watchDogTimeout);
 
+        // report bps
+        int performanceReportRate = 5000;
+        if(tunnelConfig.containsKey("performance_report_rate")) {
+            performanceReportRate = Integer.parseInt(tunnelConfig.get("performance_report_rate"));
+        }
+
+        performanceReporterTask = new Timer();
+        performanceReporterTask.scheduleAtFixedRate(new PerformanceReporter(), 5000, performanceReportRate);
+
+    }
+
+    private void initPerformanceMetrics() {
+        try {
+
+            MeasurementEngine me = new MeasurementEngine(plugin);
+
+            bytesPerSecond = DistributionSummary
+                    .builder("bytes.per.second.sender")
+                    .baseUnit("bytes")
+                    .description("Bytes transferred per second")
+                    .register(me.getCrescoMeterRegistry());
+
+
+        } catch (Exception ex) {
+            logger.error("failed to initialize PerformanceMetrics", ex);
+        }
+    }
+
+    class PerformanceReporter extends TimerTask {
+
+        public void run() {
+            try {
+                //calculate
+                float bytesPS = bytes.get() / ((float) (System.currentTimeMillis() - lastReportTS) / 1000);
+                bytes.set(0);
+                // record locally
+                bytesPerSecond.record(bytesPS);
+                // send message
+                TextMessage updatePerformanceMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
+                updatePerformanceMessage.setStringProperty("stunnel_id", tunnelConfig.get("stunnel_id"));
+                updatePerformanceMessage.setStringProperty("direction", "dst");
+                updatePerformanceMessage.setStringProperty("stats", "BPS");
+                updatePerformanceMessage.setText(String.valueOf(bytesPS));
+                plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, updatePerformanceMessage);
+                // set new time
+                lastReportTS = System.currentTimeMillis();
+            } catch (Exception ex) {
+                logger.error("failed to initialize PerformanceMetrics", ex);
+            }
+
+        }
     }
 
 
