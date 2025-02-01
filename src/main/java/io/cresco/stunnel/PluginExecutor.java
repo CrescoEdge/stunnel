@@ -9,6 +9,7 @@ import io.cresco.library.utilities.CLogger;
 import java.io.IOException;
 import java.net.*;
 import java.util.Map;
+import java.util.UUID;
 
 public class PluginExecutor implements Executor {
 
@@ -108,21 +109,28 @@ public class PluginExecutor implements Executor {
                 String dstRegion = incoming.getParam("action_dst_region");
                 String dstAgent = incoming.getParam("action_dst_agent");
                 String dstPlugin = incoming.getParam("action_dst_plugin");
+
                 int bufferSize = 8192;
-                int watchDogTimeout = 5000;
                 if(incoming.getParam("action_buffer_size") != null) {
                     bufferSize = Integer.parseInt(incoming.getParam("action_buffer_size"));
                     logger.debug("custom buffer_size: " + bufferSize);
                 }
+
+                int watchDogTimeout = 5000;
                 if(incoming.getParam("action_watchdog_timeout") != null) {
                     bufferSize = Integer.parseInt(incoming.getParam("action_watchdog_timeout"));
                     logger.debug("custom watchdog timeout: " + watchDogTimeout);
+                }
+                String sTunnelId = UUID.randomUUID().toString();
+                if(incoming.getParam("action_stunnel_id") != null) {
+                    sTunnelId = incoming.getParam("action_stunnel_id");
+                    logger.debug("custom sTunnelId: " + sTunnelId);
                 }
 
                 if(isSrcPortFree(srcPort)) {
 
                     logger.error("(1): local port is free");
-                    String sTunnelId = socketController.createSrcTunnel(srcPort, dstHost, dstPort, dstRegion, dstAgent, dstPlugin, bufferSize, watchDogTimeout);
+                    sTunnelId = socketController.createSrcTunnel(sTunnelId, srcPort, dstHost, dstPort, dstRegion, dstAgent, dstPlugin, bufferSize, watchDogTimeout);
                     if(sTunnelId != null) {
                         // set state
                         incoming.setParam("status", "10");

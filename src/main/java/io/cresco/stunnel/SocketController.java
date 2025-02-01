@@ -186,11 +186,9 @@ public class SocketController extends SocketControllerSM {
     }
 
 
-    public String createSrcTunnel(int srcPort, String dstHost, int dstPort, String dstRegion, String dstAgent, String dstPlugin, int bufferSize, int watchDogTimeout) {
+    public String createSrcTunnel(String sTunnelId, int srcPort, String dstHost, int dstPort, String dstRegion, String dstAgent, String dstPlugin, int bufferSize, int watchDogTimeout) {
         // set state
         this.incomingSrcTunnelConfig();
-
-        String sTunnelId = UUID.randomUUID().toString();
 
         try{
 
