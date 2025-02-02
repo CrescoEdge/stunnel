@@ -223,7 +223,7 @@ class SessionListener extends SessionListenerSM {
                                 mOutputStream.flush();
 
                                 // record transfer metrics
-                                tunnelListener.bytes.addAndGet(bytesRead);
+                                tunnelListener.bytes.add(bytesRead);
                             }
 
                         } else if (msg instanceof MapMessage) {

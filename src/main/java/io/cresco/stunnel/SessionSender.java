@@ -207,7 +207,7 @@ class SessionSender extends SessionSenderSM {
                                 mOutputStream.flush();
 
                                 // record transfer metrics
-                                tunnelSender.bytes.addAndGet(bytesRead);
+                                tunnelSender.bytes.add(bytesRead);
                             }
 
                         } else if (msg instanceof MapMessage) {

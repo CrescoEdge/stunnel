@@ -1,5 +1,6 @@
 package io.cresco.stunnel;
 
+import com.google.gson.Gson;
 import io.cresco.library.data.TopicType;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.metrics.MeasurementEngine;
@@ -15,6 +16,7 @@ import java.net.SocketException;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 
 //https://www.nakov.com/books/inetjava/source-code-html/Chapter-1-Sockets/1.4-TCP-Sockets/TCPForwardServer.java.html
 
@@ -42,14 +44,20 @@ public class TunnelListener implements Runnable  {
     private DistributionSummary bytesPerSecond;
     private final Timer performanceReporterTask;
 
-    public AtomicLong bytes = new AtomicLong(0);
+    //public AtomicLong bytes = new AtomicLong(0);
+    public LongAdder bytes = new LongAdder();
+
     private long lastReportTS = 0;
 
+    private Gson gson;
 
     public TunnelListener(PluginBuilder plugin, SocketController socketController, Map<String,String> tunnelConfig)  {
         this.plugin = plugin;
         logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
         this.socketController = socketController;
+
+
+        gson = new Gson();
 
         this.tunnelConfig = tunnelConfig;
 
@@ -98,20 +106,41 @@ public class TunnelListener implements Runnable  {
 
         public void run() {
             try {
+
                 //calculate
-                float bytesPS = bytes.get() / ((float) (System.currentTimeMillis() - lastReportTS) / 1000);
-                bytes.set(0);
+                //logger.error("performance reporter: " + bytesPerSecond.mean() + " tunnel: " + tunnelConfig.get("stunnel_id"));
+                float bytesPS = bytes.sum() / ((float) (System.currentTimeMillis() - lastReportTS) / 1000);
+                bytes.reset();
                 // record locally
                 bytesPerSecond.record(bytesPS);
                 // send message
                 TextMessage updatePerformanceMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
+                //updatePerformanceMessage.setStringProperty("id", "1");
                 updatePerformanceMessage.setStringProperty("stunnel_id", tunnelConfig.get("stunnel_id"));
-                updatePerformanceMessage.setStringProperty("direction", "dst");
-                updatePerformanceMessage.setStringProperty("stats", "BPS");
-                updatePerformanceMessage.setText(String.valueOf(bytesPS));
+                updatePerformanceMessage.setStringProperty("direction", "src");
+                //updatePerformanceMessage.setStringProperty("direction", "dst");
+                //updatePerformanceMessage.setStringProperty("stats", "BPS");
+                //updatePerformanceMessage.setStringProperty("ident_key", "stream_name");
+                //updatePerformanceMessage.setStringProperty("ident_id", tunnelConfig.get("stunnel_id"));
+                //updatePerformanceMessage.setStringProperty("stream_name", tunnelConfig.get("stunnel_id"));
+
+                //updatePerformanceMessage.setStringProperty("io_type_key", "type");
+                //updatePerformanceMessage.setStringProperty("output_id", "output");
+                //updatePerformanceMessage.setStringProperty("input_id", "output");
+                Map<String,String> performanceMetrics = new HashMap<>();
+                performanceMetrics.put("stunnel_id", tunnelConfig.get("stunnel_id"));
+                performanceMetrics.put("BPS", String.valueOf(bytesPS));
+                performanceMetrics.put("MBPS", String.valueOf(bytesPerSecond.mean()));
+                performanceMetrics.put("direction", "src");
+                performanceMetrics.put("tid", String.valueOf(Thread.currentThread().getId()));
+                String performanceMetricsJson = gson.toJson(performanceMetrics);
+                updatePerformanceMessage.setText(performanceMetricsJson);
+
+
                 plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, updatePerformanceMessage);
                 // set new time
                 lastReportTS = System.currentTimeMillis();
+
             } catch (Exception ex) {
                 logger.error("failed to initialize PerformanceMetrics", ex);
             }
@@ -131,6 +160,9 @@ public class TunnelListener implements Runnable  {
 
         // stop checks
         listenerHealthWatcherTask.cancel();
+
+        // stop performance checks
+        performanceReporterTask.cancel();
 
         // remove all sessions
         closeSessions();

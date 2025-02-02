@@ -1,5 +1,6 @@
 package io.cresco.stunnel;
 
+import com.google.gson.Gson;
 import io.cresco.library.data.TopicType;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.metrics.MeasurementEngine;
@@ -13,6 +14,7 @@ import java.io.StringWriter;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 
 //https://www.nakov.com/books/inetjava/source-code-html/Chapter-1-Sockets/1.4-TCP-Sockets/TCPForwardServer.java.html
 
@@ -35,14 +37,20 @@ public class TunnelSender {
     private DistributionSummary bytesPerSecond;
     private final Timer performanceReporterTask;
 
-    public AtomicLong bytes = new AtomicLong(0);
+    //public AtomicLong bytes = new AtomicLong(0);
+    public LongAdder bytes = new LongAdder();
+
     private long lastReportTS = 0;
+
+    private Gson gson;
 
     public TunnelSender(PluginBuilder plugin, SocketController socketController, Map<String,String> tunnelConfig)  {
         this.plugin = plugin;
         logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
         this.socketController = socketController;
         this.tunnelConfig = tunnelConfig;
+
+        gson = new Gson();
 
         sessionSenderLock = new AtomicBoolean();
         sessionSenders = Collections.synchronizedMap(new HashMap<>());
@@ -90,16 +98,27 @@ public class TunnelSender {
         public void run() {
             try {
                 //calculate
-                float bytesPS = bytes.get() / ((float) (System.currentTimeMillis() - lastReportTS) / 1000);
-                bytes.set(0);
+                float bytesPS = bytes.sum() / ((float) (System.currentTimeMillis() - lastReportTS) / 1000);
+                bytes.reset();
                 // record locally
                 bytesPerSecond.record(bytesPS);
                 // send message
                 TextMessage updatePerformanceMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
                 updatePerformanceMessage.setStringProperty("stunnel_id", tunnelConfig.get("stunnel_id"));
                 updatePerformanceMessage.setStringProperty("direction", "dst");
-                updatePerformanceMessage.setStringProperty("stats", "BPS");
-                updatePerformanceMessage.setText(String.valueOf(bytesPS));
+                //updatePerformanceMessage.setStringProperty("stats", "BPS");
+                //updatePerformanceMessage.setText(String.valueOf(bytesPS));
+
+                Map<String,String> performanceMetrics = new HashMap<>();
+                performanceMetrics.put("stunnel_id", tunnelConfig.get("stunnel_id"));
+                performanceMetrics.put("BPS", String.valueOf(bytesPS));
+                performanceMetrics.put("MBPS", String.valueOf(bytesPerSecond.mean()));
+                performanceMetrics.put("direction", "dst");
+                performanceMetrics.put("tid", String.valueOf(Thread.currentThread().getId()));
+                String performanceMetricsJson = gson.toJson(performanceMetrics);
+                updatePerformanceMessage.setText(performanceMetricsJson);
+
+
                 plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, updatePerformanceMessage);
                 // set new time
                 lastReportTS = System.currentTimeMillis();
@@ -136,6 +155,9 @@ public class TunnelSender {
     public void close() {
         // remove all sessions
         closeSessions();
+
+        // cancel performance monitor
+        performanceReporterTask.cancel();
 
         // cancel checks
         senderHealthWatcherTask.cancel();
@@ -244,7 +266,7 @@ public class TunnelSender {
                     socketController.removeDstTunnel();
 
                 } else {
-                    logger.error("SenderHealthWatcherTask: Health check ok");
+                    logger.debug("SenderHealthWatcherTask: Health check ok");
                 }
                 // release lock
                 inHealthCheck = false;
