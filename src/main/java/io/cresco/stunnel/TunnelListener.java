@@ -345,7 +345,7 @@ public class TunnelListener implements Runnable  {
                     // for now try and wipe it out
                     socketController.dstCommFailure();
                 } else {
-                    logger.error("ListenerHealthWatcherTask: Health check ok");
+                    logger.debug("ListenerHealthWatcherTask: Health check ok");
                 }
                 // release lock
                 inHealthCheck = false;
