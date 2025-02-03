@@ -7,6 +7,7 @@ import io.cresco.library.metrics.MeasurementEngine;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 import io.micrometer.core.instrument.DistributionSummary;
+import jakarta.jms.DeliveryMode;
 import jakarta.jms.TextMessage;
 
 import java.io.PrintWriter;
@@ -33,6 +34,8 @@ public class TunnelSender {
     private final Timer senderHealthWatcherTask;
 
     private boolean inHealthCheck = false;
+    private boolean isHealthy = true;
+
 
     private DistributionSummary bytesPerSecond;
     private final Timer performanceReporterTask;
@@ -100,14 +103,14 @@ public class TunnelSender {
                 //calculate
                 float bytesPS = bytes.sum() / ((float) (System.currentTimeMillis() - lastReportTS) / 1000);
                 bytes.reset();
+                lastReportTS = System.currentTimeMillis();
+
                 // record locally
                 bytesPerSecond.record(bytesPS);
                 // send message
                 TextMessage updatePerformanceMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
                 updatePerformanceMessage.setStringProperty("stunnel_id", tunnelConfig.get("stunnel_id"));
                 updatePerformanceMessage.setStringProperty("direction", "dst");
-                //updatePerformanceMessage.setStringProperty("stats", "BPS");
-                //updatePerformanceMessage.setText(String.valueOf(bytesPS));
 
                 Map<String,String> performanceMetrics = new HashMap<>();
                 performanceMetrics.put("stunnel_id", tunnelConfig.get("stunnel_id"));
@@ -115,13 +118,12 @@ public class TunnelSender {
                 performanceMetrics.put("MBPS", String.valueOf(bytesPerSecond.mean()));
                 performanceMetrics.put("direction", "dst");
                 performanceMetrics.put("tid", String.valueOf(Thread.currentThread().getId()));
+                performanceMetrics.put("is_healthy", String.valueOf(isHealthy));
                 String performanceMetricsJson = gson.toJson(performanceMetrics);
                 updatePerformanceMessage.setText(performanceMetricsJson);
 
+                plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, updatePerformanceMessage, DeliveryMode.NON_PERSISTENT, 4, 0);
 
-                plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, updatePerformanceMessage);
-                // set new time
-                lastReportTS = System.currentTimeMillis();
             } catch (Exception ex) {
                 logger.error("failed to initialize PerformanceMetrics", ex);
             }
@@ -264,9 +266,11 @@ public class TunnelSender {
                     logger.error("SenderHealthWatcherTask: Health check failed");
                     // for now clear clear the sessions and remove the tunnel config
                     socketController.removeDstTunnel();
+                    isHealthy = false;
 
                 } else {
                     logger.debug("SenderHealthWatcherTask: Health check ok");
+                    isHealthy = true;
                 }
                 // release lock
                 inHealthCheck = false;
