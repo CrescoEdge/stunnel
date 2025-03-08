@@ -309,6 +309,7 @@ class SessionSender extends SessionSenderSM {
                 while (outForwardingActive.get()) {
 
                     int bytesRead = mInputStream.read(buffer);
+                    tunnelSender.bytes.add(bytesRead);
 
                     if(bytesRead > 0) {
                         // normal incoming data

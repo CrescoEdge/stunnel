@@ -44,6 +44,10 @@ public class TunnelSender {
     public LongAdder bytes = new LongAdder();
 
     private long lastReportTS = 0;
+    private long lastByteCount = 0;
+    private long lastReportTimeMs = System.currentTimeMillis();
+
+
 
     private Gson gson;
 
@@ -97,37 +101,74 @@ public class TunnelSender {
     }
 
     class PerformanceReporter extends TimerTask {
+        private static final double BYTES_TO_MEGABYTES = 1.0 / (1024.0 * 1024.0);
 
         public void run() {
             try {
-                //calculate
-                float bytesPS = bytes.sum() / ((float) (System.currentTimeMillis() - lastReportTS) / 1000);
-                bytes.reset();
-                lastReportTS = System.currentTimeMillis();
+                // Get current time
+                long currentTimeMs = System.currentTimeMillis();
 
-                // record locally
-                bytesPerSecond.record(bytesPS);
-                // send message
+                // Get current byte count WITHOUT resetting
+                long currentByteCount = bytes.sum();
+
+                // Calculate deltas - bytes transferred during this period
+                long bytesDelta = currentByteCount - lastByteCount;
+
+                // Calculate elapsed time in seconds (as a double for floating point division)
+                double elapsedSeconds = (currentTimeMs - lastReportTimeMs) / 1000.0;
+
+                // Calculate rates - only if elapsed time is reasonable
+                double bytesPerSec = 0.0;
+                double megaBytesPerSec = 0.0;
+
+                if (elapsedSeconds >= 0.1) { // Avoid division by very small numbers
+                    bytesPerSec = bytesDelta / elapsedSeconds;
+                    megaBytesPerSec = bytesPerSec * BYTES_TO_MEGABYTES;
+                }
+
+                // Log detailed debug information
+                logger.debug(String.format(
+                        "Performance: delta=%d bytes, time=%.2fs, BPS=%.2f, MBPS=%.6f",
+                        bytesDelta, elapsedSeconds, bytesPerSec, megaBytesPerSec
+                ));
+
+                // Update tracking variables for next interval
+                lastByteCount = currentByteCount;
+                lastReportTimeMs = currentTimeMs;
+
+                // Instead of recording in the distribution summary, which accumulates,
+                // we'll just report the instantaneous rate
+
+                // Create message
                 TextMessage updatePerformanceMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
                 updatePerformanceMessage.setStringProperty("stunnel_id", tunnelConfig.get("stunnel_id"));
-                updatePerformanceMessage.setStringProperty("direction", "dst");
+                updatePerformanceMessage.setStringProperty("direction", "dst"); // Change to "dst" in TunnelSender
+                updatePerformanceMessage.setStringProperty("type", "stats");
 
+                // Create metrics map
                 Map<String,String> performanceMetrics = new HashMap<>();
                 performanceMetrics.put("stunnel_id", tunnelConfig.get("stunnel_id"));
-                performanceMetrics.put("BPS", String.valueOf(bytesPS));
-                performanceMetrics.put("MBPS", String.valueOf(bytesPerSecond.mean()));
-                performanceMetrics.put("direction", "dst");
+                performanceMetrics.put("BPS", String.format("%.2f", bytesPerSec));
+                performanceMetrics.put("MBPS", String.format("%.6f", megaBytesPerSec));
+                performanceMetrics.put("total_bytes", String.valueOf(currentByteCount));
+                performanceMetrics.put("direction", "dst"); // Change to "dst" in TunnelSender
                 performanceMetrics.put("tid", String.valueOf(Thread.currentThread().getId()));
                 performanceMetrics.put("is_healthy", String.valueOf(isHealthy));
+                performanceMetrics.put("elapsed_time", String.format("%.2f", elapsedSeconds));
                 String performanceMetricsJson = gson.toJson(performanceMetrics);
                 updatePerformanceMessage.setText(performanceMetricsJson);
 
-                plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, updatePerformanceMessage, DeliveryMode.NON_PERSISTENT, 4, 0);
-
+                // Send the metrics
+                plugin.getAgentService().getDataPlaneService().sendMessage(
+                        TopicType.GLOBAL,
+                        updatePerformanceMessage,
+                        DeliveryMode.NON_PERSISTENT,
+                        4,
+                        0
+                );
             } catch (Exception ex) {
-                logger.error("failed to initialize PerformanceMetrics", ex);
+                logger.error("Error in performance reporting: " + ex.getMessage(), ex);
             }
-
         }
     }
 
