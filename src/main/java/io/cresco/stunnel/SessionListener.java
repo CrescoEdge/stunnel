@@ -130,9 +130,15 @@ class SessionListener extends SessionListenerSM {
         try {
 
             //logger.info("Plugin " + plugin.getPluginID() + " creating client socket streams.");
-
+            //int bufferSize = Integer.parseInt(tunnelConfig.get("buffer_size"));
             // Turn on keep-alive for both the sockets
-            mClientSocket.setKeepAlive(true);
+            //mClientSocket.setTcpNoDelay(true); // Disable Nagle's algorithm for better latency
+
+            mClientSocket.setSendBufferSize(mClientSocket.getSendBufferSize() * 2); // Larger send buffer
+            mClientSocket.setReceiveBufferSize(mClientSocket.getReceiveBufferSize() * 2); // Larger receive buffer
+            //mClientSocket.setSoTimeout(30000); // Set socket timeout to avoid hangs
+            mClientSocket.setPerformancePreferences(0, 1, 2); // Prioritize bandwidth over latency and connection time
+
 
             // Obtain client & server input & output streams
             clientIn = mClientSocket.getInputStream();

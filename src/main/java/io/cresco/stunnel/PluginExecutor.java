@@ -110,7 +110,7 @@ public class PluginExecutor implements Executor {
                 String dstAgent = incoming.getParam("action_dst_agent");
                 String dstPlugin = incoming.getParam("action_dst_plugin");
 
-                int bufferSize = 8192;
+                int bufferSize = 65536;
                 if(incoming.getParam("action_buffer_size") != null) {
                     bufferSize = Integer.parseInt(incoming.getParam("action_buffer_size"));
                     logger.debug("custom buffer_size: " + bufferSize);
