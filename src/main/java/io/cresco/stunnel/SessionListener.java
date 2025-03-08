@@ -223,8 +223,7 @@ class SessionListener extends SessionListenerSM {
                                 mOutputStream.flush();
 
                                 // record transfer metrics
-                                tunnelListener.bytes.add(bytesRead);
-
+                                tunnelListener.performanceMonitor.addBytes(bytesRead);
                             }
 
                         } else if (msg instanceof MapMessage) {
@@ -318,7 +317,7 @@ class SessionListener extends SessionListenerSM {
                 while (outForwardingActive.get()) {
 
                     int bytesRead = mInputStream.read(buffer);
-                    tunnelListener.bytes.add(bytesRead);
+                    tunnelListener.performanceMonitor.addBytes(bytesRead);
 
                     if(bytesRead > 0) {
                         //logger.error("bytesRead: " + bytesRead);
@@ -389,4 +388,3 @@ class SessionListener extends SessionListenerSM {
 
 
 }
-

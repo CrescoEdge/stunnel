@@ -1,14 +1,9 @@
 package io.cresco.stunnel;
 
 import com.google.gson.Gson;
-import io.cresco.library.data.TopicType;
 import io.cresco.library.messaging.MsgEvent;
-import io.cresco.library.metrics.MeasurementEngine;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
-import io.micrometer.core.instrument.DistributionSummary;
-import jakarta.jms.DeliveryMode;
-import jakarta.jms.TextMessage;
 
 import java.io.IOException;
 import java.net.ServerSocket;
@@ -16,7 +11,6 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.LongAdder;
 
 //https://www.nakov.com/books/inetjava/source-code-html/Chapter-1-Sockets/1.4-TCP-Sockets/TCPForwardServer.java.html
 
@@ -41,19 +35,7 @@ public class TunnelListener implements Runnable  {
     private boolean isHealthy = true;
     public SocketController socketController;
 
-    private DistributionSummary bytesPerSecond;
-    private final Timer performanceReporterTask;
-
-    //public AtomicLong bytes = new AtomicLong(0);
-    public LongAdder bytes = new LongAdder();
-
-    private long lastReportTS = 0;
-
-    private long cumulativeBytes = 0;
-    private long lastReportedCumulativeBytes = 0;
-
-    private long lastByteCount = 0;
-    private long lastReportTimeMs = System.currentTimeMillis();
+    public PerformanceMonitor performanceMonitor;
 
 
     private Gson gson;
@@ -63,8 +45,6 @@ public class TunnelListener implements Runnable  {
         logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
         this.socketController = socketController;
 
-        //make sure this is current time
-        this.lastReportTS = System.currentTimeMillis();
 
         gson = new Gson();
 
@@ -73,8 +53,6 @@ public class TunnelListener implements Runnable  {
         sessionListenerLock = new AtomicBoolean();
         sessionListeners = Collections.synchronizedMap(new HashMap<>());
 
-        //report speed
-        initPerformanceMetrics();
 
         int watchDogTimeout = 5000;
         if(tunnelConfig.containsKey("watchdog_timeout")) {
@@ -89,100 +67,16 @@ public class TunnelListener implements Runnable  {
             performanceReportRate = Integer.parseInt(tunnelConfig.get("performance_report_rate"));
         }
 
-        performanceReporterTask = new Timer();
-        performanceReporterTask.scheduleAtFixedRate(new PerformanceReporter(), 5000, performanceReportRate);
+        this.performanceMonitor = new PerformanceMonitor(
+                plugin,
+                tunnelConfig,
+                "src",
+                "bytes.per.second.listener",
+                performanceReportRate
+        );
 
     }
 
-    private void initPerformanceMetrics() {
-        try {
-
-            MeasurementEngine me = new MeasurementEngine(plugin);
-
-            bytesPerSecond = DistributionSummary
-                    .builder("bytes.per.second.listener")
-                    .baseUnit("bytes")
-                    .description("Bytes transferred per second")
-                    .register(me.getCrescoMeterRegistry());
-
-
-        } catch (Exception ex) {
-            logger.error("failed to initialize PerformanceMetrics", ex);
-        }
-    }
-
-
-    class PerformanceReporter extends TimerTask {
-        private static final double BYTES_TO_MEGABYTES = 1.0 / (1024.0 * 1024.0);
-
-        public void run() {
-            try {
-                // Get current time
-                long currentTimeMs = System.currentTimeMillis();
-
-                // Get current byte count WITHOUT resetting
-                long currentByteCount = bytes.sum();
-
-                // Calculate deltas - bytes transferred during this period
-                long bytesDelta = currentByteCount - lastByteCount;
-
-                // Calculate elapsed time in seconds (as a double for floating point division)
-                double elapsedSeconds = (currentTimeMs - lastReportTimeMs) / 1000.0;
-
-                // Calculate rates - only if elapsed time is reasonable
-                double bytesPerSec = 0.0;
-                double megaBytesPerSec = 0.0;
-
-                if (elapsedSeconds >= 0.1) { // Avoid division by very small numbers
-                    bytesPerSec = bytesDelta / elapsedSeconds;
-                    megaBytesPerSec = bytesPerSec * BYTES_TO_MEGABYTES;
-                }
-
-                // Log detailed debug information
-                logger.debug(String.format(
-                        "Performance: delta=%d bytes, time=%.2fs, BPS=%.2f, MBPS=%.6f",
-                        bytesDelta, elapsedSeconds, bytesPerSec, megaBytesPerSec
-                ));
-
-                // Update tracking variables for next interval
-                lastByteCount = currentByteCount;
-                lastReportTimeMs = currentTimeMs;
-
-                // Instead of recording in the distribution summary, which accumulates,
-                // we'll just report the instantaneous rate
-
-                // Create message
-                TextMessage updatePerformanceMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
-                updatePerformanceMessage.setStringProperty("stunnel_id", tunnelConfig.get("stunnel_id"));
-                updatePerformanceMessage.setStringProperty("direction", "src"); // Change to "dst" in TunnelSender
-                updatePerformanceMessage.setStringProperty("type", "stats");
-
-                // Create metrics map
-                Map<String,String> performanceMetrics = new HashMap<>();
-                performanceMetrics.put("stunnel_id", tunnelConfig.get("stunnel_id"));
-                performanceMetrics.put("BPS", String.format("%.2f", bytesPerSec));
-                performanceMetrics.put("MBPS", String.format("%.6f", megaBytesPerSec));
-                performanceMetrics.put("total_bytes", String.valueOf(currentByteCount));
-                performanceMetrics.put("direction", "src"); // Change to "dst" in TunnelSender
-                performanceMetrics.put("tid", String.valueOf(Thread.currentThread().getId()));
-                performanceMetrics.put("is_healthy", String.valueOf(isHealthy));
-                performanceMetrics.put("elapsed_time", String.format("%.2f", elapsedSeconds));
-                String performanceMetricsJson = gson.toJson(performanceMetrics);
-                updatePerformanceMessage.setText(performanceMetricsJson);
-
-                // Send the metrics
-                plugin.getAgentService().getDataPlaneService().sendMessage(
-                        TopicType.GLOBAL,
-                        updatePerformanceMessage,
-                        DeliveryMode.NON_PERSISTENT,
-                        4,
-                        0
-                );
-            } catch (Exception ex) {
-                logger.error("Error in performance reporting: " + ex.getMessage(), ex);
-            }
-        }
-    }
 
     public boolean isActive() {
         return isActive;
@@ -196,8 +90,9 @@ public class TunnelListener implements Runnable  {
         // stop checks
         listenerHealthWatcherTask.cancel();
 
-        // stop performance checks
-        performanceReporterTask.cancel();
+        if (performanceMonitor != null) {
+            performanceMonitor.shutdown();
+        }
 
         // remove all sessions
         closeSessions();
@@ -380,9 +275,11 @@ public class TunnelListener implements Runnable  {
                     // for now try and wipe it out
                     socketController.dstCommFailure();
                     isHealthy = false;
+                    performanceMonitor.setHealthy(false);
                 } else {
                     logger.debug("ListenerHealthWatcherTask: Health check ok");
                     isHealthy = true;
+                    performanceMonitor.setHealthy(true);
                 }
                 // release lock
                 inHealthCheck = false;
@@ -391,8 +288,3 @@ public class TunnelListener implements Runnable  {
     }
 
 }
-
-
-
-
-

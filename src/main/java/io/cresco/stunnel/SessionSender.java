@@ -207,7 +207,7 @@ class SessionSender extends SessionSenderSM {
                                 mOutputStream.flush();
 
                                 // record transfer metrics
-                                tunnelSender.bytes.add(bytesRead);
+                                tunnelSender.performanceMonitor.addBytes(bytesRead);
                             }
 
                         } else if (msg instanceof MapMessage) {
@@ -309,7 +309,7 @@ class SessionSender extends SessionSenderSM {
                 while (outForwardingActive.get()) {
 
                     int bytesRead = mInputStream.read(buffer);
-                    tunnelSender.bytes.add(bytesRead);
+                    tunnelSender.performanceMonitor.addBytes(bytesRead);
 
                     if(bytesRead > 0) {
                         // normal incoming data
