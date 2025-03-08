@@ -119,6 +119,7 @@ public class TunnelListener implements Runnable  {
                 TextMessage updatePerformanceMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
                 updatePerformanceMessage.setStringProperty("stunnel_id", tunnelConfig.get("stunnel_id"));
                 updatePerformanceMessage.setStringProperty("direction", "src");
+                updatePerformanceMessage.setStringProperty("type", "stats");
 
                 Map<String,String> performanceMetrics = new HashMap<>();
                 performanceMetrics.put("stunnel_id", tunnelConfig.get("stunnel_id"));
