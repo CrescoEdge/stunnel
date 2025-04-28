@@ -222,7 +222,7 @@ public class PerformanceMonitor {
                 if (bytesDelta == 0) {
                     consecutiveZeroReports++;
                     if (consecutiveZeroReports > 3 && currentByteCount > 0) {
-                        logger.warn(direction + ": No bytes recorded for " +
+                        logger.debug(direction + ": No bytes recorded for " +
                                 consecutiveZeroReports + " reports, possible measurement issue");
                     }
                 } else {
