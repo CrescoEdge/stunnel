@@ -11,8 +11,8 @@ import jakarta.jms.TextMessage;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
@@ -24,33 +24,33 @@ import java.util.concurrent.atomic.LongAdder;
  */
 public class PerformanceMonitor {
     // Core dependencies - these aren't final for OSGi compatibility
-    private PluginBuilder plugin;
-    private CLogger logger;
-    private Map<String, String> tunnelConfig;
-    private String direction;
-    private String metricName;
-    private Gson gson;
+    private final PluginBuilder plugin;
+    private final CLogger logger;
+    private final Map<String, String> tunnelConfig;
+    private final String direction;
+    private final String metricName;
+    private final Gson gson;
 
     // Performance tracking objects
-    private LongAdder bytesAdder;
-    private AtomicLong lastTotalBytes;
-    private AtomicLong lastReportTimeMs;
+    private final LongAdder bytesAdder;
+    private final AtomicLong lastTotalBytes;
+    private final AtomicLong lastReportTimeMs;
 
     // Constants converted to instance fields
-    private double bytesToBits;
-    private double bitsToMegabits;
-    private double bytesToMegabytes;
+    private final double bytesToBits;
+    private final double bitsToMegabits;
+    private final double bytesToMegabytes;
 
     // Configuration
-    private int bufferSize;
+    private final int bufferSize;
 
     // Metrics and scheduling
     private DistributionSummary bytesPerSecond;
-    private ScheduledExecutorService scheduler;
+    private final ScheduledExecutorService scheduler;
     private volatile boolean isHealthy;
 
     // Debugging configuration
-    private boolean debugMode;
+    private final boolean debugMode;
 
     /**
      * Creates a new performance monitor
