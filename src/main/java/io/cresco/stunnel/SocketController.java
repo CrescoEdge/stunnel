@@ -28,10 +28,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -55,6 +53,8 @@ public class SocketController {
     private final Map<String, Channel> activeServerChannels = new ConcurrentHashMap<>(); // Map stunnel_id -> Server Channel (src)
     private final Map<String, Channel> activeClientChannels = new ConcurrentHashMap<>(); // Map client_id -> Client Channel (src)
     private final Map<String, Channel> activeTargetChannels = new ConcurrentHashMap<>(); // Map client_id -> Target Channel (dst)
+    private final Map<String, ScheduledFuture<?>> activeHealthChecks = new ConcurrentHashMap<>();
+
 
     // State machine for overall tunnel state. For a multi-tunnel environment, this
     // should be evolved into a Map<String, SocketControllerSM> to track each tunnel's state.
@@ -79,8 +79,6 @@ public class SocketController {
     public void stateNotify(String stunnelId, String node) {
         if(logger != null) {
             logger.info("Tunnel [" + stunnelId + "] State Change: " + node);
-            // This is where logic could be triggered based on state transitions.
-            // For example, entering a "RECOVERY" state could trigger reconnection logic.
         }
     }
 
@@ -92,7 +90,6 @@ public class SocketController {
     // --- Tunnel Configuration Persistence ---
 
     private Path getTunnelConfigPath(String stunnelId) {
-        // Ensure plugin data directory exists
         Path pluginDataDir = Paths.get(plugin.getPluginDataDirectory());
         try {
             if (!Files.exists(pluginDataDir)) {
@@ -112,7 +109,7 @@ public class SocketController {
         if (configPath == null) return null;
 
         if (Files.exists(configPath) && !Files.isDirectory(configPath)) {
-            logger.info("Loading tunnel config: " + configPath);
+            logger.debug("Loading tunnel config: " + configPath);
             try (BufferedReader reader = Files.newBufferedReader(configPath)) {
                 savedTunnelConfig = gson.fromJson(reader, mapType);
             } catch (Exception e) {
@@ -184,7 +181,7 @@ public class SocketController {
                         if (validateTunnelConfig(candidateConfig)) {
                             logger.info("Valid startup config found for " + stunnelId + ". Attempting to recreate tunnel...");
                             if (isSrcConfig(candidateConfig)) {
-                                startSrcTunnel(candidateConfig);
+                                scheduler.schedule(new ReconnectTask(stunnelId), 1, TimeUnit.SECONDS);
                             } else {
                                 logger.warn("Startup config for " + stunnelId + " appears to be for DST side. Cannot auto-start.");
                             }
@@ -254,11 +251,11 @@ public class SocketController {
             return stunnelId;
         }
 
-        getTunnelStateMachine(stunnelId).incomingSrcTunnelConfig();
-        stateNotify(stunnelId, "initTunnelListener");
+        // Save the config first so the reconnect task can find it
+        saveTunnelConfig(tunnelConfig);
 
+        // THIS IS THE SYNCHRONOUS, CORRECTED INITIAL CREATION
         logger.info("Attempting to create SRC tunnel: " + stunnelId);
-
         logger.debug("Sending CONFIG message to setup DST tunnel: " + stunnelId);
         MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
         request.setParam("action", "configdsttunnel");
@@ -271,14 +268,14 @@ public class SocketController {
                 return stunnelId;
             } else {
                 logger.error("Failed to start Netty SRC listener for " + stunnelId + " after DST setup.");
-                getTunnelStateMachine(stunnelId).failedTunnelListenerInit();
-                stateNotify(stunnelId, "pluginActive");
+                // Schedule a reconnect because the config is valid but the listener failed
+                scheduler.schedule(new ReconnectTask(stunnelId), 5, TimeUnit.SECONDS);
                 return null;
             }
         } else {
-            logger.error("Failed to setup DST tunnel for " + stunnelId + ". Aborting SRC setup. Response: " + (response != null ? response.getParams() : "null"));
-            getTunnelStateMachine(stunnelId).failedTunnelListenerInit();
-            stateNotify(stunnelId, "pluginActive");
+            logger.error("Failed to setup DST tunnel for " + stunnelId + ". Aborting SRC setup. Scheduling reconnect. Response: " + (response != null ? response.getParams() : "null"));
+            // Schedule a reconnect because the config is valid but the destination is not ready
+            scheduler.schedule(new ReconnectTask(stunnelId), 5, TimeUnit.SECONDS);
             return null;
         }
     }
@@ -314,41 +311,27 @@ public class SocketController {
 
             logger.info("Netty Server (Src) started successfully on port " + srcPort + " for tunnel " + stunnelId);
 
-            // Add listener for automatic reconnection on unexpected closure
+            startHealthCheck(stunnelId, tunnelConfig, serverChannel);
+
             serverChannel.closeFuture().addListener(future -> {
                 logger.warn("Netty Server (Src) channel for tunnel " + stunnelId + " has closed.");
-                cleanupSrcTunnelResources(stunnelId); // Clean up old resources first
+                cleanupSrcTunnelResources(stunnelId);
 
-                // Do not try to reconnect if the shutdown is intentional
-                if (bossGroup != null && !bossGroup.isShuttingDown() && plugin.isActive()) {
-                    getTunnelStateMachine(stunnelId).dstCommFailure();
-                    stateNotify(stunnelId, "tunnelListenerRecovery");
-                    logger.info("Attempting to reconnect SRC tunnel " + stunnelId + " in 5 seconds...");
-                    scheduler.schedule(() -> {
-                        logger.info("Rebinding SRC tunnel listener for " + stunnelId);
-                        Map<String, String> latestConfig = getSavedTunnelConfig(stunnelId);
-                        if (latestConfig != null) {
-                            if(startSrcTunnel(latestConfig) != null) {
-                                getTunnelStateMachine(stunnelId).recoveredTunnel();
-                                stateNotify(stunnelId, "activeTunnelListener");
-                            } else {
-                                getTunnelStateMachine(stunnelId).failedRecoveredTunnel();
-                                stateNotify(stunnelId, "errorTunnelListener");
-                            }
-                        } else {
-                            logger.error("Could not find saved config for stunnel_id " + stunnelId + ". Cannot reconnect.");
-                            getTunnelStateMachine(stunnelId).failedRecoveredTunnel();
-                            stateNotify(stunnelId, "errorTunnelListener");
-                        }
-                    }, 5, TimeUnit.SECONDS);
+                // **FIX**: The decision to reconnect is now based on the existence of the config file,
+                // ensuring the tunnel recovers unless explicitly removed.
+                if (getSavedTunnelConfig(stunnelId) != null) {
+                    // Prevent scheduling if the plugin itself is being shut down completely
+                    if(!scheduler.isShutdown()) {
+                        logger.info("Tunnel config exists. Scheduling persistent reconnection for tunnel " + stunnelId);
+                        scheduler.schedule(new ReconnectTask(stunnelId), 5, TimeUnit.SECONDS);
+                    } else {
+                        logger.warn("Scheduler is shutdown. Cannot reconnect tunnel " + stunnelId);
+                    }
                 } else {
-                    logger.info("Shutdown is in progress or plugin is inactive. Will not reconnect SRC tunnel " + stunnelId);
+                    logger.info("Tunnel config has been removed. Will not reconnect SRC tunnel " + stunnelId);
                 }
             });
 
-            getTunnelStateMachine(stunnelId).completeTunnelListenerInit();
-            stateNotify(stunnelId, "activeTunnelListener");
-            saveTunnelConfig(tunnelConfig);
             return true;
 
         } catch (Exception e) {
@@ -358,27 +341,70 @@ public class SocketController {
         }
     }
 
+    private class ReconnectTask implements Runnable {
+        private final String stunnelId;
+
+        ReconnectTask(String stunnelId) {
+            this.stunnelId = stunnelId;
+        }
+
+        @Override
+        public void run() {
+            // **FIX**: The check for plugin.isActive() is removed to ensure reconnection is always attempted.
+            // The task will only abort if it's shutting down or the tunnel is already active.
+            if (scheduler.isShutdown() || activeServerChannels.containsKey(stunnelId)) {
+                if(scheduler.isShutdown()) logger.warn("ReconnectTask: Scheduler is shutdown, aborting reconnect for " + stunnelId);
+                if(activeServerChannels.containsKey(stunnelId)) logger.warn("ReconnectTask: Tunnel already active, aborting reconnect for " + stunnelId);
+                return;
+            }
+
+            logger.info("ReconnectTask: Attempting to re-establish tunnel " + stunnelId);
+            Map<String, String> tunnelConfig = getSavedTunnelConfig(stunnelId);
+            if (tunnelConfig == null) {
+                logger.error("ReconnectTask: Could not find saved config for stunnel_id " + stunnelId + ". Aborting reconnect permanently.");
+                return; // Stop retrying if config is gone
+            }
+
+            // Step 1: RELENTLESSLY RE-CONFIGURE THE DESTINATION.
+            logger.info("ReconnectTask: Sending configuration to destination for " + stunnelId);
+            MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
+            request.setParam("action", "configdsttunnel");
+            request.setParam("action_tunnel_config", gson.toJson(tunnelConfig));
+            MsgEvent response = plugin.sendRPC(request);
+
+            // Step 2: If destination is configured, start the source. If not, TRY AGAIN.
+            if (response != null && "10".equals(response.getParam("status"))) {
+                logger.info("ReconnectTask: Destination for " + stunnelId + " configured successfully. Starting source listener.");
+                if (startSrcTunnelNettyInternal(tunnelConfig)) {
+                    logger.info("ReconnectTask: Tunnel " + stunnelId + " successfully re-established.");
+                } else {
+                    logger.error("ReconnectTask: Failed to start source listener for " + stunnelId + ". Retrying in 10 seconds.");
+                    scheduler.schedule(this, 10, TimeUnit.SECONDS);
+                }
+            } else {
+                logger.warn("ReconnectTask: Failed to re-configure destination tunnel for " + stunnelId + ". Retrying in 10 seconds. Response: " + (response != null ? response.getParams() : "null"));
+                scheduler.schedule(this, 10, TimeUnit.SECONDS);
+            }
+        }
+    }
+
     public Map<String, String> createDstTunnel(Map<String, String> tunnelConfig) {
         if (!validateTunnelConfig(tunnelConfig)) {
             logger.error("Cannot create dst tunnel: Invalid configuration provided.");
             return null;
         }
         String stunnelId = tunnelConfig.get("stunnel_id");
-        getTunnelStateMachine(stunnelId).incomingDstTunnelConfig();
-        stateNotify(stunnelId, "initTunnelSender");
+        // Clean up any old resources for this tunnel ID before creating a new one.
+        cleanupDstTunnelResources(stunnelId);
 
         activeTunnelsConfig.put(stunnelId, tunnelConfig);
         if (createPerformanceMonitor(tunnelConfig, "dst") == null) {
             logger.error("Failed to create Performance Monitor for DST tunnel " + stunnelId);
             activeTunnelsConfig.remove(stunnelId);
-            getTunnelStateMachine(stunnelId).failedTunnelSenderInit();
-            stateNotify(stunnelId, "pluginActive");
             return null;
         }
 
         logger.info("DST tunnel configured successfully for ID: " + stunnelId);
-        getTunnelStateMachine(stunnelId).completeTunnelSenderInit();
-        stateNotify(stunnelId, "activeTunnelSender");
         return tunnelConfig;
     }
 
@@ -411,8 +437,7 @@ public class SocketController {
                 .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000);
 
-        // Initiate connection attempt with retry logic
-        connectWithRetry(b, dstHost, dstPort, tunnelConfig, clientId, 3); // Attempt up to 3 times
+        connectWithRetry(b, dstHost, dstPort, tunnelConfig, clientId, 3);
 
         return true;
     }
@@ -446,6 +471,64 @@ public class SocketController {
             logger.debug("Sent DST session connection failed status (9) to SRC for ClientID: " + clientId);
         } catch (Exception e) {
             logger.error("Failed to send DST session failed status to SRC for ClientID: " + clientId, e);
+        }
+    }
+
+
+    // --- Health Check Management ---
+
+    private void startHealthCheck(String stunnelId, Map<String, String> tunnelConfig, Channel serverChannel) {
+        AtomicInteger consecutiveFailures = new AtomicInteger(0);
+        int failureThreshold = 2;
+        long healthCheckInterval = 5; // seconds
+
+        Runnable healthCheckTask = () -> {
+            try {
+                if (!serverChannel.isOpen()) {
+                    stopHealthCheck(stunnelId);
+                    return;
+                }
+
+                logger.debug("Performing health check for tunnel: " + stunnelId);
+                MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
+                request.setParam("action", "tunnelhealthcheck");
+                request.setParam("action_stunnel_id", stunnelId);
+
+                MsgEvent response = plugin.sendRPC(request);
+
+                if (response != null && "10".equals(response.getParam("status"))) {
+                    consecutiveFailures.set(0);
+                    logger.debug("Health check successful for tunnel: " + stunnelId);
+                } else {
+                    int failures = consecutiveFailures.incrementAndGet();
+                    logger.warn("Health check failed for tunnel: " + stunnelId + ". Consecutive failures: " + failures);
+                    if (failures >= failureThreshold) {
+                        logger.error("Health check failure threshold reached for tunnel: " + stunnelId + ". Forcing tunnel closure and rebuild.");
+                        serverChannel.close(); // This will trigger the closeFuture listener to rebuild the tunnel
+                        stopHealthCheck(stunnelId);
+                    }
+                }
+            } catch (Exception e) {
+                logger.error("Exception during health check for tunnel: " + stunnelId, e);
+                int failures = consecutiveFailures.incrementAndGet();
+                if (failures >= failureThreshold) {
+                    logger.error("Health check exception threshold reached for tunnel: " + stunnelId + ". Forcing tunnel closure and rebuild.");
+                    serverChannel.close();
+                    stopHealthCheck(stunnelId);
+                }
+            }
+        };
+
+        ScheduledFuture<?> healthCheckFuture = scheduler.scheduleAtFixedRate(healthCheckTask, healthCheckInterval, healthCheckInterval, TimeUnit.SECONDS);
+        activeHealthChecks.put(stunnelId, healthCheckFuture);
+        logger.info("Health check scheduled for tunnel " + stunnelId + " every " + healthCheckInterval + " seconds.");
+    }
+
+    private void stopHealthCheck(String stunnelId) {
+        ScheduledFuture<?> healthCheckFuture = activeHealthChecks.remove(stunnelId);
+        if (healthCheckFuture != null) {
+            healthCheckFuture.cancel(true);
+            logger.info("Health check stopped for tunnel: " + stunnelId);
         }
     }
 
@@ -512,19 +595,24 @@ public class SocketController {
 
     public void removeSrcTunnel(String stunnelId) {
         logger.info("Removing SRC tunnel: " + stunnelId);
-        cleanupSrcTunnelResources(stunnelId);
+
+        // This is the crucial step that prevents reconnection.
         deleteTunnelConfig(stunnelId);
+
+        stopHealthCheck(stunnelId);
+
+        Channel serverChannel = activeServerChannels.get(stunnelId);
+        if (serverChannel != null && serverChannel.isOpen()) {
+            serverChannel.close(); // This will trigger the closeFuture listener, which will see the deleted config and stop.
+        } else {
+            // If channel is already closed, we still need to clean up resources
+            cleanupSrcTunnelResources(stunnelId);
+        }
     }
 
     private void cleanupSrcTunnelResources(String stunnelId) {
-        Channel serverChannel = activeServerChannels.remove(stunnelId);
-        if (serverChannel != null && serverChannel.isOpen()) {
-            logger.debug("Closing server channel for " + stunnelId);
-            serverChannel.close().addListener(future -> {
-                if(future.isSuccess()) logger.debug("Closed server channel successfully for " + stunnelId);
-                else logger.warn("Failed to close server channel for " + stunnelId, future.cause());
-            });
-        }
+        stopHealthCheck(stunnelId);
+        activeServerChannels.remove(stunnelId);
 
         List<String> clientsToClose = new ArrayList<>();
         activeClientChannels.forEach((clientId, channel) -> {
@@ -537,11 +625,10 @@ public class SocketController {
         if (!clientsToClose.isEmpty()) {
             logger.debug("Closing " + clientsToClose.size() + " client channels for SRC tunnel " + stunnelId);
             clientsToClose.forEach(clientId -> {
-                Channel clientChannel = activeClientChannels.get(clientId);
+                Channel clientChannel = activeClientChannels.remove(clientId);
                 if(clientChannel != null && clientChannel.isOpen()) {
                     clientChannel.close();
                 }
-                activeClientChannels.remove(clientId);
             });
         }
 
@@ -572,11 +659,10 @@ public class SocketController {
         if (!targetsToClose.isEmpty()) {
             logger.debug("Closing " + targetsToClose.size() + " target channels for DST tunnel " + stunnelId);
             targetsToClose.forEach(clientId -> {
-                Channel targetChannel = activeTargetChannels.get(clientId);
+                Channel targetChannel = activeTargetChannels.remove(clientId);
                 if(targetChannel != null && targetChannel.isOpen()) {
                     targetChannel.close();
                 }
-                activeTargetChannels.remove(clientId);
             });
         }
 
@@ -592,19 +678,19 @@ public class SocketController {
 
     public void shutdown() {
         logger.info("Shutting down SocketController and all Netty components...");
-        getTunnelStateMachine("global").startShutdown(); // Global state
+        // Gracefully shutdown the scheduler to stop new reconnection tasks
+        scheduler.shutdown();
 
-        List<String> stunnelIds = new ArrayList<>(activeTunnelsConfig.keySet());
-        stunnelIds.forEach(id -> {
-            if (activeServerChannels.containsKey(id)) {
-                removeSrcTunnel(id);
-            }
-            cleanupDstTunnelResources(id);
-        });
+        // Close all active server channels, which will trigger their cleanup listeners
+        activeServerChannels.values().forEach(Channel::close);
 
         try {
-            Thread.sleep(100);
-        } catch (InterruptedException ignored) {
+            // Give time for cleanup and tasks to finish
+            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
             Thread.currentThread().interrupt();
         }
 
@@ -624,12 +710,12 @@ public class SocketController {
             logger.debug("Netty EventLoopGroups shutdown.");
         }
 
+        // Clear any remaining in-memory state
         activeServerChannels.clear();
         activeClientChannels.clear();
         activeTargetChannels.clear();
         activeTunnelsConfig.clear();
         performanceMonitors.clear();
-        scheduler.shutdown();
 
         logger.info("SocketController shutdown complete.");
     }

@@ -168,12 +168,14 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 if (statusMessage.itemExists("status")) {
                     int status = statusMessage.getInt("status");
                     logger.debug("Received status message from DST for ClientID: " + clientId + ", Status: " + status);
+                    // MODIFIED: Handle both status 8 (graceful close) and status 9 (error) from DST
                     if (status == 8) {
                         logger.info("Received graceful close notification (status 8) from DST for ClientID: " + clientId + ". Closing SRC channel.");
                         removeJmsListener();
                         ctx.close();
                     } else if (status == 9) {
-                        logger.error("Received connection failed notification (status 9) from DST for ClientID: " + clientId + ". Closing SRC channel.");
+                        String error = statusMessage.itemExists("error") ? statusMessage.getString("error") : "Unknown error";
+                        logger.error("Received connection failed notification (status 9) from DST for ClientID: " + clientId + ". Reason: " + error + ". Closing SRC channel.");
                         ctx.close();
                     }
                 }

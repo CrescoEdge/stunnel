@@ -59,6 +59,8 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private String clientId;
     private String stunnelId;
     private String jmsListenerId;
+    private boolean exceptionHandled = false;
+    private boolean gracefulCloseInitiatedBySrc = false;
 
     public DstSessionHandler(SocketController sc, PluginBuilder pb, PerformanceMonitor pm) {
         this.socketController = sc;
@@ -156,6 +158,7 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     logger.debug("Received status message from SRC for ClientID: " + clientId + ", Status: " + status);
                     if (status == 8) {
                         logger.info("Received graceful close notification (status 8) from SRC for ClientID: " + clientId + ". Closing DST channel (to target).");
+                        this.gracefulCloseInitiatedBySrc = true;
                         removeJmsListener();
                         ctx.close();
                     }
@@ -190,11 +193,12 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             socketController.removeTargetChannel(this.clientId);
         }
 
-        // Only send a notification if we are the ones initiating the close
-        if (this.jmsListenerId != null) {
-            notifySrcOfClose();
-            removeJmsListener();
+        if (this.jmsListenerId != null && !this.exceptionHandled && !this.gracefulCloseInitiatedBySrc) {
+            logger.warn("DST Channel for ClientID: " + clientId + " closed unexpectedly by the target server. Notifying SRC.");
+            notifySrcOfError(new IOException("Connection closed by target server."));
         }
+
+        removeJmsListener();
     }
 
     private void removeJmsListener() {
@@ -209,7 +213,7 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
     }
 
-    private void notifySrcOfClose() {
+    private void notifySrcOfError(Throwable cause) {
         try {
             Map<String, String> currentTunnelConfig = socketController.getTunnelConfig(stunnelId);
             if (currentTunnelConfig != null) {
@@ -217,29 +221,58 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 closeMessage.setStringProperty("stunnel_id", this.stunnelId);
                 closeMessage.setStringProperty("direction", "src");
                 closeMessage.setStringProperty("client_id", this.clientId);
-                closeMessage.setInt("status", 8);
+                closeMessage.setInt("status", 9); // Set status to 9 for ERROR
+                closeMessage.setString("error", "DST Failure: " + (cause != null ? cause.toString() : "Unknown reason"));
                 plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, closeMessage);
-                logger.debug("Sent graceful close notification (status 8) to SRC for ClientID: " + clientId);
+                logger.debug("Sent error notification (status 9) to SRC for ClientID: " + clientId);
             } else {
-                logger.warn("Cannot send close notification for ClientID " + clientId + ": Tunnel config not found.");
+                logger.warn("Cannot send error notification for ClientID " + clientId + ": Tunnel config not found.");
             }
         } catch (Exception e) {
-            logger.error("Failed to send close notification to SRC for ClientID: " + clientId, e);
+            logger.error("Failed to send error notification to SRC for ClientID: " + clientId, e);
         }
+    }
+
+    private void notifySrcOfGracefulClose() {
+        try {
+            Map<String, String> currentTunnelConfig = socketController.getTunnelConfig(stunnelId);
+            if (currentTunnelConfig != null) {
+                MapMessage closeMessage = plugin.getAgentService().getDataPlaneService().createMapMessage();
+                closeMessage.setStringProperty("stunnel_id", this.stunnelId);
+                closeMessage.setStringProperty("direction", "src");
+                closeMessage.setStringProperty("client_id", this.clientId);
+                closeMessage.setInt("status", 8); // Status 8 for graceful close
+                plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, closeMessage);
+                logger.debug("Sent graceful close notification (status 8) to SRC for ClientID: " + clientId);
+            }
+        } catch (Exception e) {
+            logger.error("Failed to send graceful close notification to SRC for ClientID: " + clientId, e);
+        }
+    }
+
+    private boolean isConnectionReset(Throwable cause) {
+        if (cause instanceof java.io.IOException && cause.getMessage() != null) {
+            String msg = cause.getMessage().toLowerCase();
+            return msg.contains("connection reset") || msg.contains("broken pipe");
+        }
+        return false;
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        if (cause instanceof IOException && cause.getMessage() != null &&
-                (cause.getMessage().toLowerCase().contains("connection reset by peer") ||
-                        cause.getMessage().toLowerCase().contains("broken pipe") ||
-                        cause.getMessage().toLowerCase().contains("forcibly closed"))) {
-            logger.warn("DST Exception Caught (likely target server disconnect) for ClientID: " + clientId + ", Reason: " + cause.getMessage());
+        this.exceptionHandled = true;
+
+        if (isConnectionReset(cause)) {
+            logger.info("DST Channel for ClientID: " + clientId + " was closed by the target server. Treating as a normal disconnect.");
+            notifySrcOfGracefulClose();
         } else if (cause instanceof java.net.ConnectException) {
             logger.error("DST Connection Exception Caught for ClientID: " + clientId + ", Reason: " + cause.getMessage());
+            notifySrcOfError(cause);
         } else {
             logger.error("DST Unhandled Exception Caught for ClientID: " + clientId, cause);
+            notifySrcOfError(cause);
         }
+
         ctx.close();
     }
 }
