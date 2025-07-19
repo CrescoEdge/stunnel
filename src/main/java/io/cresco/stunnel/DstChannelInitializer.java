@@ -193,9 +193,11 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             socketController.removeTargetChannel(this.clientId);
         }
 
+        // MODIFIED: If the channel goes inactive and it wasn't a graceful close initiated by the source,
+        // treat it as a normal disconnect from the target and notify the source gracefully.
         if (this.jmsListenerId != null && !this.exceptionHandled && !this.gracefulCloseInitiatedBySrc) {
-            logger.warn("DST Channel for ClientID: " + clientId + " closed unexpectedly by the target server. Notifying SRC.");
-            notifySrcOfError(new IOException("Connection closed by target server."));
+            logger.info("DST Channel for ClientID: " + clientId + " closed by the target server. Notifying SRC.");
+            notifySrcOfGracefulClose(); // MODIFIED: Send status 8 instead of status 9
         }
 
         removeJmsListener();

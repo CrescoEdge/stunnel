@@ -95,6 +95,27 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
         socketController.addClientChannel(clientId, ctx.channel());
         logger.info("SRC Channel Active: " + ctx.channel().remoteAddress() + ", ClientID: " + clientId + ", StunnelID: " + stunnelId);
 
+        // MODIFIED: Perform a pre-flight health check before attempting to create a session
+        logger.debug("Performing pre-flight health check for DST config on tunnel: " + stunnelId);
+        MsgEvent healthCheckRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,
+                currentTunnelConfig.get("dst_region"),
+                currentTunnelConfig.get("dst_agent"),
+                currentTunnelConfig.get("dst_plugin"));
+        healthCheckRequest.setParam("action", "tunnelhealthcheck");
+        healthCheckRequest.setParam("action_stunnel_id", stunnelId);
+
+        MsgEvent healthCheckResponse = plugin.sendRPC(healthCheckRequest);
+
+        if (healthCheckResponse != null && "10".equals(healthCheckResponse.getParam("status"))) {
+            logger.debug("Pre-flight health check successful for tunnel: " + stunnelId + ". Proceeding with session setup.");
+            initiateDstSession(ctx, currentTunnelConfig);
+        } else {
+            logger.error("Pre-flight health check FAILED for tunnel " + stunnelId + ". Destination is not ready or config is missing. Closing SRC channel.");
+            ctx.close();
+        }
+    }
+
+    private void initiateDstSession(ChannelHandlerContext ctx, Map<String, String> currentTunnelConfig) {
         MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG,
                 currentTunnelConfig.get("dst_region"),
                 currentTunnelConfig.get("dst_agent"),
@@ -168,7 +189,6 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 if (statusMessage.itemExists("status")) {
                     int status = statusMessage.getInt("status");
                     logger.debug("Received status message from DST for ClientID: " + clientId + ", Status: " + status);
-                    // MODIFIED: Handle both status 8 (graceful close) and status 9 (error) from DST
                     if (status == 8) {
                         logger.info("Received graceful close notification (status 8) from DST for ClientID: " + clientId + ". Closing SRC channel.");
                         removeJmsListener();
@@ -209,7 +229,6 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             socketController.removeClientChannel(this.clientId);
         }
 
-        // Only send a notification if we are the ones initiating the close
         if (this.jmsListenerId != null) {
             notifyDstOfClose();
             removeJmsListener();
