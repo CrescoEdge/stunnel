@@ -140,7 +140,7 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private void processJmsMessage(ChannelHandlerContext ctx, Message msg) {
         if (!ctx.channel().isActive()) {
-            logger.warn("processJmsMessage: Channel inactive for ClientID: " + clientId + ". Ignoring JMS message.");
+            logger.debug("processJmsMessage: Channel inactive for ClientID: " + clientId + ". Ignoring JMS message.");
             return;
         }
         try {
