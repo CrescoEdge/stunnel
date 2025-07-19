@@ -236,7 +236,7 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         cause.getMessage().toLowerCase().contains("forcibly closed"))) {
             logger.warn("DST Exception Caught (likely target server disconnect) for ClientID: " + clientId + ", Reason: " + cause.getMessage());
         } else if (cause instanceof java.net.ConnectException) {
-            logger.error("DST Connection Exception Caught for ClientID: " + clientId + ", Reason: " + cause.getMessage());
+            logger.error("DST Connection Exception Caught for ClientID: " + clientId, ", Reason: " + cause.getMessage());
         } else {
             logger.error("DST Unhandled Exception Caught for ClientID: " + clientId, cause);
         }
