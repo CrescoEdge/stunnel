@@ -6,7 +6,11 @@ import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
+import io.cresco.stunnel.state.SocketControllerSM;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 public class PluginExecutor implements Executor {
@@ -69,6 +73,12 @@ public class PluginExecutor implements Executor {
                 switch (action) {
                     case "tunnelhealthcheck":
                         return tunnelHealthCheck(incoming);
+                    case "listtunnels":
+                        return listTunnels(incoming);
+                    case "gettunnelstatus":
+                        return getTunnelStatus(incoming);
+                    case "gettunnelconfig":
+                        return getTunnelConfig(incoming);
                     default:
                         logger.error("Unknown/Unsupported EXEC action: {}", action);
                         incoming.setParam("status", "99");
@@ -119,6 +129,7 @@ public class PluginExecutor implements Executor {
                 incoming.setParam("status", "10");
                 incoming.setParam("status_desc", "SRC tunnel creation initiated successfully.");
                 incoming.setParam("stunnel_id", createdStunnelId);
+                incoming.setCompressedParam("stunnel_config", gson.toJson(tunnelConfig));
             } else {
                 incoming.setParam("status", "9");
                 incoming.setParam("status_desc", "Failed to create SRC tunnel (check logs for details).");
@@ -269,6 +280,90 @@ public class PluginExecutor implements Executor {
             }
         } catch (Exception e) {
             logger.error("Error during tunnelhealthcheck processing", e);
+            incoming.setParam("status", "500");
+            incoming.setParam("status_desc", "Internal error: " + e.getMessage());
+        }
+        return incoming;
+    }
+
+    private MsgEvent listTunnels(MsgEvent incoming) {
+        logger.info("Handling listtunnels request...");
+        try {
+            Map<String, Map<String, String>> tunnels = socketController.getActiveTunnels();
+            List<Map<String, String>> tunnelList = new ArrayList<>();
+
+            for(String stunnelId : tunnels.keySet()) {
+                Map<String, String> tunnelInfo = new HashMap<>();
+                SocketControllerSM sm = socketController.getTunnelStateMachine(stunnelId);
+                String status = (sm != null) ? sm.getState().name() : "UNKNOWN";
+                tunnelInfo.put("stunnel_id", stunnelId);
+                tunnelInfo.put("status", status);
+                tunnelList.add(tunnelInfo);
+            }
+
+            incoming.setParam("tunnels", gson.toJson(tunnelList));
+            incoming.setParam("status", "10");
+            incoming.setParam("status_desc", "Successfully retrieved tunnel list.");
+
+        } catch (Exception e) {
+            logger.error("Error during listtunnels processing", e);
+            incoming.setParam("status", "500");
+            incoming.setParam("status_desc", "Internal error: " + e.getMessage());
+        }
+        return incoming;
+    }
+
+    private MsgEvent getTunnelStatus(MsgEvent incoming) {
+        logger.info("Handling gettunnelstatus request...");
+        try {
+            String stunnelId = incoming.getParam("action_stunnel_id");
+            if (stunnelId != null) {
+                Map<String, String> tunnelConfig = socketController.getTunnelConfig(stunnelId);
+                if (tunnelConfig != null) {
+                    SocketControllerSM sm = socketController.getTunnelStateMachine(stunnelId);
+                    String status = (sm != null) ? sm.getState().name() : "UNKNOWN";
+                    incoming.setParam("stunnel_id", stunnelId);
+                    incoming.setParam("tunnel_status", status);
+                    incoming.setParam("status", "10");
+                    incoming.setParam("status_desc", "Successfully retrieved tunnel status.");
+                } else {
+                    incoming.setParam("status", "9");
+                    incoming.setParam("status_desc", "Tunnel config not found for " + stunnelId);
+                }
+            } else {
+                logger.error("Missing 'action_stunnel_id' for gettunnelstatus.");
+                incoming.setParam("status", "400");
+                incoming.setParam("status_desc", "Missing required parameter: action_stunnel_id");
+            }
+        } catch (Exception e) {
+            logger.error("Error during gettunnelstatus processing", e);
+            incoming.setParam("status", "500");
+            incoming.setParam("status_desc", "Internal error: " + e.getMessage());
+        }
+        return incoming;
+    }
+
+    private MsgEvent getTunnelConfig(MsgEvent incoming) {
+        logger.info("Handling gettunnelconfig request...");
+        try {
+            String stunnelId = incoming.getParam("action_stunnel_id");
+            if (stunnelId != null) {
+                Map<String, String> tunnelConfig = socketController.getTunnelConfig(stunnelId);
+                if (tunnelConfig != null) {
+                    incoming.setParam("tunnel_config", gson.toJson(tunnelConfig));
+                    incoming.setParam("status", "10");
+                    incoming.setParam("status_desc", "Successfully retrieved tunnel configuration.");
+                } else {
+                    incoming.setParam("status", "9");
+                    incoming.setParam("status_desc", "Tunnel config not found for " + stunnelId);
+                }
+            } else {
+                logger.error("Missing 'action_stunnel_id' for gettunnelconfig.");
+                incoming.setParam("status", "400");
+                incoming.setParam("status_desc", "Missing required parameter: action_stunnel_id");
+            }
+        } catch (Exception e) {
+            logger.error("Error during gettunnelconfig processing", e);
             incoming.setParam("status", "500");
             incoming.setParam("status_desc", "Internal error: " + e.getMessage());
         }

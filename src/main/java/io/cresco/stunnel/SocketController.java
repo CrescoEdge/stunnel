@@ -82,7 +82,7 @@ public class SocketController {
         }
     }
 
-    private SocketControllerSM getTunnelStateMachine(String stunnelId) {
+    public SocketControllerSM getTunnelStateMachine(String stunnelId) {
         return tunnelStateMachines.computeIfAbsent(stunnelId, k -> new SocketControllerSM());
     }
 
@@ -718,6 +718,10 @@ public class SocketController {
         performanceMonitors.clear();
 
         logger.info("SocketController shutdown complete.");
+    }
+
+    public Map<String, Map<String,String>> getActiveTunnels() {
+        return new HashMap<>(activeTunnelsConfig);
     }
 
     public Map<String, String> getTunnelConfig(String stunnelId) {
