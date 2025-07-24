@@ -71,8 +71,6 @@ public class PluginExecutor implements Executor {
             String action = incoming.getParam("action");
             try {
                 switch (action) {
-                    case "tunnelhealthcheck":
-                        return tunnelHealthCheck(incoming);
                     case "listtunnels":
                         return listTunnels(incoming);
                     case "gettunnelstatus":
@@ -254,32 +252,6 @@ public class PluginExecutor implements Executor {
             }
         } catch (Exception e) {
             logger.error("Error during removedsttunnel processing", e);
-            incoming.setParam("status", "500");
-            incoming.setParam("status_desc", "Internal error: " + e.getMessage());
-        }
-        return incoming;
-    }
-
-    private MsgEvent tunnelHealthCheck(MsgEvent incoming) {
-        logger.debug("Handling tunnelhealthcheck request...");
-        try {
-            String stunnelId = incoming.getParam("action_stunnel_id");
-            if (stunnelId != null) {
-                boolean isConfigured = socketController.getTunnelConfig(stunnelId) != null;
-                if (isConfigured) {
-                    incoming.setParam("status", "10");
-                    incoming.setParam("status_desc", "Tunnel config found locally.");
-                } else {
-                    incoming.setParam("status", "9");
-                    incoming.setParam("status_desc", "Tunnel config not found locally for " + stunnelId);
-                }
-            } else {
-                logger.error("Missing 'action_stunnel_id' for tunnelhealthcheck.");
-                incoming.setParam("status", "400");
-                incoming.setParam("status_desc", "Missing required parameter: action_stunnel_id");
-            }
-        } catch (Exception e) {
-            logger.error("Error during tunnelhealthcheck processing", e);
             incoming.setParam("status", "500");
             incoming.setParam("status_desc", "Internal error: " + e.getMessage());
         }
