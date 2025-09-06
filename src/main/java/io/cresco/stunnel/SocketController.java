@@ -489,7 +489,28 @@ public class SocketController {
                     return;
                 }
 
-                logger.debug("Performing health check for tunnel: " + stunnelId);
+                PerformanceMonitor pm = performanceMonitors.get(stunnelId + "_src");
+                boolean recentlyActive = false;
+                if (pm != null) {
+                    long lastActivity = pm.getLastActivityTimeMs();
+                    if (lastActivity > 0) { // Ensure we don't check against the initial '0' value
+                        long idleTime = System.currentTimeMillis() - lastActivity;
+                        // If active within the last 2 health check intervals, consider it healthy.
+                        if (idleTime < (healthCheckInterval * 1000 * 2)) {
+                            recentlyActive = true;
+                        }
+                    }
+                }
+
+                // If data is flowing, the tunnel is healthy. Skip the active probe.
+                if (recentlyActive) {
+                    logger.debug("Tunnel " + stunnelId + " is actively transferring data. Skipping active health check.");
+                    consecutiveFailures.set(0); // Reset failures because we have proof of life
+                    return; // End the task for this cycle
+                }
+
+                // If the tunnel is idle, proceed with the active network probe.
+                logger.debug("Tunnel " + stunnelId + " is idle. Performing active health check.");
                 MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
                 request.setParam("action", "tunnelhealthcheck");
                 request.setParam("action_stunnel_id", stunnelId);

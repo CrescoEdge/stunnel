@@ -33,8 +33,8 @@ public class PerformanceMonitor {
 
     // Performance tracking objects
     private final LongAdder bytesAdder;
-    private final AtomicLong lastTotalBytes;
     private final AtomicLong lastReportTimeMs;
+    private final AtomicLong lastActivityTimeMs;
 
     // Constants converted to instance fields
     private final double bytesToBits;
@@ -73,7 +73,7 @@ public class PerformanceMonitor {
 
         // Initialize measuring objects
         this.bytesAdder = new LongAdder();
-        this.lastTotalBytes = new AtomicLong(0);
+        this.lastActivityTimeMs = new AtomicLong(0);
         this.lastReportTimeMs = new AtomicLong(System.currentTimeMillis());
 
         // Set up constants as instance variables
@@ -154,6 +154,9 @@ public class PerformanceMonitor {
             return; // Ignore non-positive byte counts
         }
 
+        // Update the activity timestamp every time data is processed
+        lastActivityTimeMs.set(System.currentTimeMillis());
+
         // Add to the adder for thread-safe accumulation
         bytesAdder.add(byteCount);
 
@@ -163,6 +166,10 @@ public class PerformanceMonitor {
         if (debugMode && byteCount > bufferSize) {
             logger.debug("Large byte count added: " + byteCount + " bytes in " + direction);
         }
+    }
+
+    public long getLastActivityTimeMs() {
+        return lastActivityTimeMs.get();
     }
 
     /**

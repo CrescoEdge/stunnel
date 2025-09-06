@@ -176,6 +176,7 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (bytesRead > 0) {
             performanceMonitor.addBytes(bytesRead);
             BytesMessage bytesMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
+            bytesMessage.setJMSPriority(0);
             bytesMessage.setStringProperty("stunnel_id", this.stunnelId);
             bytesMessage.setStringProperty("direction", "src");
             bytesMessage.setStringProperty("client_id", this.clientId);
