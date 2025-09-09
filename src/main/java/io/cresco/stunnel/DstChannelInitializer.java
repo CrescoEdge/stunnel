@@ -4,23 +4,19 @@ import io.cresco.library.data.TopicType;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 import io.netty.buffer.ByteBuf;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInitializer;
-import io.netty.channel.ChannelPipeline;
-import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.*;
 import io.netty.channel.socket.SocketChannel;
+import io.netty.util.concurrent.ScheduledFuture;
 import jakarta.jms.BytesMessage;
 import jakarta.jms.MapMessage;
 import jakarta.jms.Message;
 import jakarta.jms.MessageListener;
-
 import java.io.IOException;
+import java.net.ConnectException;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
-/**
- * Initializes the ChannelPipeline for outgoing connections created by the Bootstrap
- * on the destination side of the tunnel (connecting to the target server).
- */
 public class DstChannelInitializer extends ChannelInitializer<SocketChannel> {
 
     private final SocketController socketController;
@@ -41,15 +37,13 @@ public class DstChannelInitializer extends ChannelInitializer<SocketChannel> {
     public void initChannel(SocketChannel ch) throws Exception {
         ChannelPipeline p = ch.pipeline();
         String stunnelId = tunnelConfig.get("stunnel_id");
+        ch.config().setAllowHalfClosure(true);
         ch.attr(SrcChannelInitializer.CLIENT_ID_KEY).set(clientId);
         ch.attr(SrcChannelInitializer.STUNNEL_ID_KEY).set(stunnelId);
         p.addLast(new DstSessionHandler(socketController, plugin, performanceMonitor));
     }
 }
 
-/**
- * Handles data flow and lifecycle for the connection to the target server on the destination side.
- */
 class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private final SocketController socketController;
@@ -60,7 +54,13 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private String stunnelId;
     private String jmsListenerId;
     private boolean exceptionHandled = false;
-    private boolean gracefulCloseInitiatedBySrc = false;
+
+    private volatile boolean gracefulCloseInitiatedBySrc = false;
+    private volatile boolean eosSeen = false;
+    private volatile boolean outputShutdown = false;
+    private long pendingWrites = 0;
+    private static final long EOS_TIMEOUT_MS = 5000;
+    private ScheduledFuture<?> eosTimeout;
 
     public DstSessionHandler(SocketController sc, PluginBuilder pb, PerformanceMonitor pm) {
         this.socketController = sc;
@@ -73,26 +73,12 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     public void channelActive(ChannelHandlerContext ctx) throws Exception {
         this.clientId = ctx.channel().attr(SrcChannelInitializer.CLIENT_ID_KEY).get();
         this.stunnelId = ctx.channel().attr(SrcChannelInitializer.STUNNEL_ID_KEY).get();
-
-        if (clientId == null || stunnelId == null) {
-            logger.error("CRITICAL: ClientID or StunnelID missing from channel attributes on DST side. Closing channel.");
-            ctx.close();
-            return;
-        }
-
-        Map<String, String> currentTunnelConfig = socketController.getTunnelConfig(stunnelId);
-        if (currentTunnelConfig == null) {
-            logger.error("CRITICAL: Tunnel config not found for StunnelID: " + stunnelId + " on DST side. Closing channel.");
-            ctx.close();
-            return;
-        }
-
         socketController.addTargetChannel(clientId, ctx.channel());
         logger.info("DST Channel Active (to target): " + ctx.channel().remoteAddress() + ", ClientID: " + clientId + ", StunnelID: " + stunnelId);
-        setupJmsListener(ctx, currentTunnelConfig);
+        setupJmsListener(ctx);
     }
 
-    private void setupJmsListener(ChannelHandlerContext ctx, Map<String, String> currentTunnelConfig) {
+    private void setupJmsListener(ChannelHandlerContext ctx) {
         try {
             MessageListener ml = msg -> {
                 if (ctx.channel().eventLoop().inEventLoop()) {
@@ -103,64 +89,68 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             };
             String queryString = String.format("stunnel_id='%s' AND client_id='%s' AND direction='dst'", this.stunnelId, this.clientId);
             this.jmsListenerId = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL, ml, queryString);
-            logger.debug("JMS listener started for ClientID: " + clientId + " (ListenerID: " + jmsListenerId + ")");
         } catch (Exception e) {
             logger.error("Failed to setup JMS listener for ClientID: " + clientId + " on DST side. Closing connection.", e);
+            notifySrcOfError(e);
             ctx.close();
-            sendDstSessionFailedStatus(currentTunnelConfig, clientId, e);
-        }
-    }
-
-    private void sendDstSessionFailedStatus(Map<String,String> tunnelConfig, String clientId, Throwable cause) {
-        try {
-            MapMessage statusMessage = plugin.getAgentService().getDataPlaneService().createMapMessage();
-            statusMessage.setStringProperty("stunnel_id", tunnelConfig.get("stunnel_id"));
-            statusMessage.setStringProperty("direction", "src");
-            statusMessage.setStringProperty("client_id", clientId);
-            statusMessage.setInt("status", 9);
-            statusMessage.setString("error", "Failed during DST session setup/JMS: " + (cause != null ? cause.getMessage() : "Unknown reason"));
-            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, statusMessage);
-            logger.debug("Sent DST session setup failed status (9) to SRC for ClientID: " + clientId);
-        } catch (Exception e) {
-            logger.error("Failed to send DST session failed status to SRC for ClientID: " + clientId, e);
         }
     }
 
     private void processJmsMessage(ChannelHandlerContext ctx, Message msg) {
-        if (!ctx.channel().isActive()) {
-            logger.debug("processJmsMessage: DST Channel inactive for ClientID: " + clientId + ". Ignoring JMS message.");
-            return;
-        }
+        if (!ctx.channel().isActive()) return;
+
         try {
             if (msg instanceof BytesMessage) {
-                BytesMessage bytesMessage = (BytesMessage) msg;
-                long bodyLength = bytesMessage.getBodyLength();
-                if (bodyLength > 0) {
-                    ByteBuf buffer = ctx.alloc().buffer((int) bodyLength);
-                    try {
-                        byte[] data = new byte[(int) bodyLength];
-                        int bytesRead = bytesMessage.readBytes(data);
-                        if (bytesRead != bodyLength) {
-                            logger.warn("JMS BytesMessage read mismatch for ClientID: " + clientId + ". Expected " + bodyLength + ", got " + bytesRead);
-                        }
-                        buffer.writeBytes(data);
-                        ctx.writeAndFlush(buffer);
-                        performanceMonitor.addBytes(bodyLength);
-                    } catch(Exception readEx) {
-                        buffer.release();
-                        throw readEx;
-                    }
+                BytesMessage m = (BytesMessage) msg;
+                boolean eos = m.propertyExists("eos") && m.getBooleanProperty("eos");
+
+                if (eos) {
+                    logger.info("EOS marker received from SRC for ClientID: " + clientId);
+                    eosSeen = true;
+                    if (eosTimeout != null) { eosTimeout.cancel(false); eosTimeout = null; }
+                    maybeHalfClose(ctx);
+                    return;
                 }
+
+                m.reset();
+                byte[] chunk = new byte[8192];
+                int n;
+                long total = 0L;
+                while ((n = m.readBytes(chunk)) > 0) {
+                    ByteBuf buf = ctx.alloc().buffer(n);
+                    buf.writeBytes(chunk, 0, n);
+                    ChannelPromise p = ctx.newPromise();
+                    pendingWrites++;
+                    ctx.write(buf, p);
+                    p.addListener(f -> {
+                        if (!f.isSuccess()) {
+                            logger.warn("Write failed for ClientID: " + clientId, f.cause());
+                        }
+                        if (--pendingWrites == 0) {
+                            maybeHalfClose(ctx);
+                        }
+                    });
+                    total += n;
+                }
+                ctx.flush();
+                if (total > 0) performanceMonitor.addBytes(total);
+
             } else if (msg instanceof MapMessage) {
                 MapMessage statusMessage = (MapMessage) msg;
                 if (statusMessage.itemExists("status")) {
                     int status = statusMessage.getInt("status");
-                    logger.debug("Received status message from SRC for ClientID: " + clientId + ", Status: " + status);
                     if (status == 8) {
-                        logger.info("Received graceful close notification (status 8) from SRC for ClientID: " + clientId + ". Closing DST channel (to target).");
+                        logger.info("Received graceful close (prepare) from SRC for ClientID: " + clientId + ". Waiting for EOS and drain.");
                         this.gracefulCloseInitiatedBySrc = true;
-                        removeJmsListener();
-                        ctx.close();
+                        if (!eosSeen && eosTimeout == null) {
+                            eosTimeout = ctx.executor().schedule(() -> {
+                                if (!eosSeen) {
+                                    logger.error("EOS not received within timeout for ClientID: " + clientId + ". Failing the tunnel.");
+                                    notifySrcOfError(new Exception("EOS timeout on DST"));
+                                    ctx.close();
+                                }
+                            }, EOS_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                        }
                     }
                 }
             }
@@ -168,6 +158,27 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             logger.error("Error processing JMS message for ClientID: " + clientId + " on DST side.", e);
             ctx.close();
         }
+    }
+
+    private void maybeHalfClose(ChannelHandlerContext ctx) {
+        if (outputShutdown || !eosSeen || pendingWrites != 0) return;
+
+        outputShutdown = true;
+        ctx.writeAndFlush(Unpooled.EMPTY_BUFFER)
+                .addListener(ChannelFutureListener.CLOSE_ON_FAILURE)
+                .addListener(f -> {
+                    if (f.isSuccess()) {
+                        try {
+                            ((SocketChannel) ctx.channel()).shutdownOutput().addListener(ChannelFutureListener.CLOSE_ON_FAILURE);
+                            logger.debug("shutdownOutput sent for ClientID: " + clientId);
+                        } catch (Throwable t) {
+                            logger.warn("shutdownOutput failed for ClientID: " + clientId, t);
+                            ctx.close();
+                        }
+                    } else {
+                        ctx.close();
+                    }
+                });
     }
 
     @Override
@@ -190,47 +201,48 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         logger.info("DST Channel Inactive (to target): " + ctx.channel().remoteAddress() + ", ClientID: " + clientId);
-        if (this.clientId != null) {
-            socketController.removeTargetChannel(this.clientId);
-        }
+        if (eosTimeout != null) { eosTimeout.cancel(false); eosTimeout = null; }
+        if (this.clientId != null) socketController.removeTargetChannel(this.clientId);
 
-        // MODIFIED: If the channel goes inactive and it wasn't a graceful close initiated by the source,
-        // treat it as a normal disconnect from the target and notify the source gracefully.
-        if (this.jmsListenerId != null && !this.exceptionHandled && !this.gracefulCloseInitiatedBySrc) {
-            logger.info("DST Channel for ClientID: " + clientId + " closed by the target server. Notifying SRC.");
-            notifySrcOfGracefulClose(); // MODIFIED: Send status 8 instead of status 9
+        if (this.jmsListenerId != null && !exceptionHandled && !gracefulCloseInitiatedBySrc) {
+            sendEosToSrc();
+            notifySrcOfGracefulClose();
         }
-
         removeJmsListener();
     }
 
     private void removeJmsListener() {
         if (this.jmsListenerId != null) {
-            try {
-                plugin.getAgentService().getDataPlaneService().removeMessageListener(this.jmsListenerId);
-                logger.debug("JMS listener removed for ClientID: " + clientId + " (ListenerID: " + jmsListenerId + ")");
-            } catch (Exception e) {
-                logger.error("Error removing JMS listener for ClientID: " + clientId, e);
-            }
+            plugin.getAgentService().getDataPlaneService().removeMessageListener(this.jmsListenerId);
             this.jmsListenerId = null;
+        }
+    }
+
+    private void sendEosToSrc() {
+        try {
+            BytesMessage eos = plugin.getAgentService().getDataPlaneService().createBytesMessage();
+            eos.setJMSPriority(0);
+            eos.setStringProperty("stunnel_id", stunnelId);
+            eos.setStringProperty("direction", "src");
+            eos.setStringProperty("client_id", clientId);
+            eos.setBooleanProperty("eos", true);
+            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, eos);
+            logger.debug("EOS sent to SRC for ClientID: " + clientId);
+        } catch (Exception e) {
+            logger.error("Failed to send EOS to SRC for ClientID: " + clientId, e);
         }
     }
 
     private void notifySrcOfError(Throwable cause) {
         try {
-            Map<String, String> currentTunnelConfig = socketController.getTunnelConfig(stunnelId);
-            if (currentTunnelConfig != null) {
-                MapMessage closeMessage = plugin.getAgentService().getDataPlaneService().createMapMessage();
-                closeMessage.setStringProperty("stunnel_id", this.stunnelId);
-                closeMessage.setStringProperty("direction", "src");
-                closeMessage.setStringProperty("client_id", this.clientId);
-                closeMessage.setInt("status", 9); // Set status to 9 for ERROR
-                closeMessage.setString("error", "DST Failure: " + (cause != null ? cause.toString() : "Unknown reason"));
-                plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, closeMessage);
-                logger.debug("Sent error notification (status 9) to SRC for ClientID: " + clientId);
-            } else {
-                logger.warn("Cannot send error notification for ClientID " + clientId + ": Tunnel config not found.");
-            }
+            MapMessage closeMessage = plugin.getAgentService().getDataPlaneService().createMapMessage();
+            closeMessage.setStringProperty("stunnel_id", this.stunnelId);
+            closeMessage.setStringProperty("direction", "src");
+            closeMessage.setStringProperty("client_id", this.clientId);
+            closeMessage.setInt("status", 9);
+            closeMessage.setString("error", "DST Failure: " + (cause != null ? cause.toString() : "Unknown reason"));
+            closeMessage.setJMSPriority(0);
+            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, closeMessage);
         } catch (Exception e) {
             logger.error("Failed to send error notification to SRC for ClientID: " + clientId, e);
         }
@@ -238,44 +250,31 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private void notifySrcOfGracefulClose() {
         try {
-            Map<String, String> currentTunnelConfig = socketController.getTunnelConfig(stunnelId);
-            if (currentTunnelConfig != null) {
-                MapMessage closeMessage = plugin.getAgentService().getDataPlaneService().createMapMessage();
-                closeMessage.setStringProperty("stunnel_id", this.stunnelId);
-                closeMessage.setStringProperty("direction", "src");
-                closeMessage.setStringProperty("client_id", this.clientId);
-                closeMessage.setInt("status", 8); // Status 8 for graceful close
-                plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, closeMessage);
-                logger.debug("Sent graceful close notification (status 8) to SRC for ClientID: " + clientId);
-            }
+            MapMessage closeMessage = plugin.getAgentService().getDataPlaneService().createMapMessage();
+            closeMessage.setStringProperty("stunnel_id", this.stunnelId);
+            closeMessage.setStringProperty("direction", "src");
+            closeMessage.setStringProperty("client_id", this.clientId);
+            closeMessage.setInt("status", 8);
+            closeMessage.setJMSPriority(0);
+            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, closeMessage);
         } catch (Exception e) {
             logger.error("Failed to send graceful close notification to SRC for ClientID: " + clientId, e);
         }
     }
 
-    private boolean isConnectionReset(Throwable cause) {
-        if (cause instanceof java.io.IOException && cause.getMessage() != null) {
-            String msg = cause.getMessage().toLowerCase();
-            return msg.contains("connection reset") || msg.contains("broken pipe");
-        }
-        return false;
-    }
-
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
         this.exceptionHandled = true;
-
-        if (isConnectionReset(cause)) {
-            logger.info("DST Channel for ClientID: " + clientId + " was closed by the target server. Treating as a normal disconnect.");
-            notifySrcOfGracefulClose();
-        } else if (cause instanceof java.net.ConnectException) {
+        if (cause instanceof ConnectException) {
             logger.error("DST Connection Exception Caught for ClientID: " + clientId + ", Reason: " + cause.getMessage());
-            notifySrcOfError(cause);
+        } else if (cause instanceof IOException) {
+            logger.info("DST Channel for ClientID: " + clientId + " was closed by the target server. Treating as a normal disconnect.");
         } else {
             logger.error("DST Unhandled Exception Caught for ClientID: " + clientId, cause);
-            notifySrcOfError(cause);
         }
 
+        sendEosToSrc();
+        notifySrcOfError(cause);
         ctx.close();
     }
 }
