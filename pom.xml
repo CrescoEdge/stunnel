@@ -4,13 +4,17 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>io.cresco</groupId>
+    <parent>
+        <groupId>io.cresco</groupId>
+        <artifactId>cresco-parent</artifactId>
+        <version>1.2-SNAPSHOT</version>
+        <relativePath/>
+    </parent>
+
     <artifactId>stunnel</artifactId>
-    <version>1.2-SNAPSHOT</version>
 
-
-    <name>Cresco Repo</name>
-    <description>Cresco framework plugin repo</description>
+    <name>Cresco sTunnel</name>
+    <description>Cresco framework secure tunnel plugin</description>
     <url>https://github.com/CrescoEdge/stunnel</url>
 
     <licenses>
@@ -20,7 +24,6 @@
             <distribution>stunnel</distribution>
         </license>
     </licenses>
-
 
     <distributionManagement>
         <snapshotRepository>
@@ -33,82 +36,54 @@
         </repository>
     </distributionManagement>
 
-
     <scm>
         <connection>scm:git:git://github.com/CrescoEdge/stunnel.git</connection>
         <developerConnection>scm:git:git://github.com/CrescoEdge/stunnel.git</developerConnection>
         <url>git@github.com:CrescoEdge/stunnel.git</url>
     </scm>
 
-
     <properties>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <jdk>21</jdk>
-        <maven.compiler.version>3.13.0</maven.compiler.version>
-        <maven.bundle.compiler.version>5.1.9</maven.bundle.compiler.version>
-        <gson.version>2.8.5</gson.version>
-        <derby.version>10.14.2.0</derby.version>
+        <!-- jdk, encoding, plugin & OSGi API / gson versions inherited from cresco-parent -->
         <netty.version>4.1.116.Final</netty.version>
     </properties>
 
-
     <dependencies>
 
-        <!-- https://mvnrepository.com/artifact/org.osgi/org.osgi.core -->
-
+        <!-- OSGi API versions managed by cresco-parent; build-time only -> provided -->
         <dependency>
             <groupId>org.osgi</groupId>
             <artifactId>org.osgi.core</artifactId>
-            <version>6.0.0</version>
             <scope>provided</scope>
         </dependency>
-
-        <!-- https://mvnrepository.com/artifact/org.osgi/osgi.cmpn -->
         <dependency>
             <groupId>org.osgi</groupId>
             <artifactId>osgi.cmpn</artifactId>
-            <version>6.0.0</version>
             <scope>provided</scope>
         </dependency>
-
         <dependency>
             <groupId>org.osgi</groupId>
             <artifactId>osgi.annotation</artifactId>
-            <version>6.0.1</version>
+            <scope>provided</scope>
         </dependency>
-
-
-
-        <!-- https://mvnrepository.com/artifact/org.osgi/org.osgi.service.component.annotations -->
         <dependency>
             <groupId>org.osgi</groupId>
             <artifactId>org.osgi.service.component.annotations</artifactId>
-            <version>1.4.0</version>
             <scope>provided</scope>
         </dependency>
-
-        <!-- https://mvnrepository.com/artifact/org.osgi/org.osgi.service.metatype.annotations -->
         <dependency>
             <groupId>org.osgi</groupId>
             <artifactId>org.osgi.service.metatype.annotations</artifactId>
-            <version>1.4.0</version>
             <scope>provided</scope>
         </dependency>
-
-        <!-- https://mvnrepository.com/artifact/org.osgi/org.osgi.service.cm -->
         <dependency>
             <groupId>org.osgi</groupId>
             <artifactId>org.osgi.service.cm</artifactId>
-            <version>1.6.0</version>
             <scope>provided</scope>
         </dependency>
-
-
 
         <dependency>
             <groupId>com.google.code.gson</groupId>
             <artifactId>gson</artifactId>
-            <version>${gson.version}</version>
         </dependency>
 
         <dependency>
@@ -118,46 +93,40 @@
             <scope>provided</scope>
         </dependency>
 
+        <!--
+          Netty is runtime-required and not exported by any other bundle, so it is embedded
+          (scope compile). It was previously 'provided', which only worked because the old
+          scope-less Embed-Dependency swept provided jars into the bundle anyway.
+        -->
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-buffer</artifactId>
             <version>${netty.version}</version>
-            <scope>provided</scope>
         </dependency>
-
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-common</artifactId>
             <version>${netty.version}</version>
-            <scope>provided</scope>
         </dependency>
-
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-resolver</artifactId>
             <version>${netty.version}</version>
-            <scope>provided</scope>
         </dependency>
-
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-handler</artifactId>
             <version>${netty.version}</version>
-            <scope>provided</scope>
         </dependency>
-
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-transport</artifactId>
             <version>${netty.version}</version>
-            <scope>provided</scope>
         </dependency>
-
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-codec</artifactId>
             <version>${netty.version}</version>
-            <scope>provided</scope>
         </dependency>
 
     </dependencies>
@@ -165,21 +134,12 @@
     <build>
         <plugins>
 
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>${maven.compiler.version}</version>
-                <configuration>
-                    <source>${jdk}</source>
-                    <target>${jdk}</target>
-                </configuration>
-            </plugin>
+            <!-- maven-compiler-plugin (source/target 21) inherited from cresco-parent -->
 
             <plugin>
                 <groupId>org.apache.felix</groupId>
                 <artifactId>maven-bundle-plugin</artifactId>
-                <version>${maven.bundle.compiler.version}</version>
-                <extensions>true</extensions>
+                <!-- version + extensions inherited from cresco-parent pluginManagement -->
                 <configuration>
                     <instructions>
                         <Bundle-SymbolicName>${project.groupId}.${project.artifactId}</Bundle-SymbolicName>
@@ -187,10 +147,16 @@
                         <Bundle-Description>sTunnel Plugin</Bundle-Description>
                         <Bundle-Vendor>Cresco.io</Bundle-Vendor>
                         <Bundle-Version>${project.version}-${maven.build.timestamp}</Bundle-Version>
-                        <Bundle-Activator>io.cresco.stunnel.Activator</Bundle-Activator>
-                        <Import-Package>*;resolution:=optional</Import-Package>
-                        <Embed-Dependency>!org.osgi.*;!osgi.cmpn.*;!library;*</Embed-Dependency>
-                        <Bundle-RequiredExecutionEnvironment>JavaSE-1.8</Bundle-RequiredExecutionEnvironment>
+                        <!-- Entry point is the DS @Component (io.cresco.stunnel.Plugin); no Bundle-Activator. -->
+                        <!-- Cresco SPI + OSGi framework are hard requirements; embedded libs stay optional. -->
+                        <Import-Package>
+                            org.osgi.framework,
+                            org.osgi.framework.*,
+                            io.cresco.library.*,
+                            *;resolution:=optional
+                        </Import-Package>
+                        <!-- scope=compile|runtime keeps provided/test jars out of the bundle -->
+                        <Embed-Dependency>!org.osgi.*;!osgi.cmpn.*;!library;*;scope=compile|runtime</Embed-Dependency>
                     </instructions>
                 </configuration>
             </plugin>
@@ -198,24 +164,4 @@
         </plugins>
     </build>
 
-    <profiles>
-        <profile>
-            <id>allow-snapshots</id>
-            <activation><activeByDefault>true</activeByDefault></activation>
-            <repositories>
-                <repository>
-                    <id>snapshots-repo</id>
-                    <url>https://oss.sonatype.org/content/repositories/snapshots</url>
-                    <releases><enabled>false</enabled></releases>
-                    <snapshots><enabled>true</enabled></snapshots>
-                </repository>
-            </repositories>
-        </profile>
-    </profiles>
-
-
 </project>
-
-
-
-
