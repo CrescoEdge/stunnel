@@ -8,6 +8,8 @@ import io.cresco.library.plugin.PluginService;
 import io.cresco.library.utilities.CLogger;
 import org.osgi.framework.BundleContext;
 import org.osgi.service.component.annotations.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -28,6 +30,8 @@ public class Plugin implements PluginService {
     private Executor executor;
     // Logger instance
     private CLogger logger;
+    // SLF4J fallback for lifecycle paths where the CLogger is null (before start / after deactivate).
+    private static final Logger slog = LoggerFactory.getLogger(Plugin.class);
     // Configuration map from OSGi
     private Map<String,Object> map;
     // The core controller, now using Netty
@@ -54,7 +58,7 @@ public class Plugin implements PluginService {
         if (logger != null) {
             logger.info("Configuration modified. Restarting/reconfiguring might be needed.");
         } else {
-            System.out.println("Plugin configuration modified but logger not yet initialized.");
+            slog.info("Plugin configuration modified but logger not yet initialized.");
         }
     }
 
@@ -70,7 +74,7 @@ public class Plugin implements PluginService {
         this.executor = null;
         this.socketController = null;
         this.logger = null;
-        System.out.println("sTunnel Plugin Deactivated.");
+        slog.info("sTunnel Plugin Deactivated.");
     }
 
     // Check if the plugin is currently active using the internal state flag
@@ -135,8 +139,7 @@ public class Plugin implements PluginService {
             if (logger != null) {
                 logger.error("sTunnel Plugin startup failed: " + ex.getMessage(), ex);
             } else {
-                System.err.println("sTunnel Plugin startup failed (logger not initialized): " + ex.getMessage());
-                ex.printStackTrace(); // Print stack trace if logger failed
+                slog.error("sTunnel Plugin startup failed (logger not initialized)", ex);
             }
             // Ensure cleanup if startup fails partially
             isStopped();
