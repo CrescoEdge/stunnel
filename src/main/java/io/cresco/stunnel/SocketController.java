@@ -10,10 +10,12 @@ import io.cresco.library.utilities.CLogger;
 import io.cresco.stunnel.state.SocketControllerSM;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.AdaptiveRecvByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
@@ -291,13 +293,24 @@ public class SocketController {
                 return false;
             }
 
+            int sockBuf = plugin.getConfig().getIntegerParam("stunnel_socket_buffer_bytes", 4 * 1024 * 1024);
+            int readMax = plugin.getConfig().getIntegerParam("stunnel_read_chunk_bytes", 256 * 1024);
+            int writeHigh = plugin.getConfig().getIntegerParam("stunnel_write_high_water_bytes", 2 * 1024 * 1024);
+
             ServerBootstrap b = new ServerBootstrap();
             b.group(bossGroup, workerGroup)
                     .channel(NioServerSocketChannel.class)
                     .childHandler(new SrcChannelInitializer(this, plugin, tunnelConfig, pm))
                     .option(ChannelOption.SO_BACKLOG, 128)
                     .childOption(ChannelOption.SO_KEEPALIVE, true)
-                    .childOption(ChannelOption.TCP_NODELAY, true);
+                    .childOption(ChannelOption.TCP_NODELAY, true)
+                    // Enlarge per-read size so each ingress read -> one large broker message (default
+                    // adaptive allocator caps reads at 64KB -> the slow small-message regime), and grow
+                    // the socket buffers. All configurable; defaults preserve behavior on slow edges.
+                    .childOption(ChannelOption.SO_RCVBUF, sockBuf)
+                    .childOption(ChannelOption.SO_SNDBUF, sockBuf)
+                    .childOption(ChannelOption.RCVBUF_ALLOCATOR, new AdaptiveRecvByteBufAllocator(2048, 65536, readMax))
+                    .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(writeHigh / 2, writeHigh));
 
             ChannelFuture f = b.bind(srcPort).sync();
             Channel serverChannel = f.channel();
@@ -429,13 +442,22 @@ public class SocketController {
 
         logger.info("Attempting to create DST session for ClientID: " + clientId + " connecting to " + dstHost + ":" + dstPort);
 
+        int sockBuf = plugin.getConfig().getIntegerParam("stunnel_socket_buffer_bytes", 4 * 1024 * 1024);
+        int readMax = plugin.getConfig().getIntegerParam("stunnel_read_chunk_bytes", 256 * 1024);
+        int writeHigh = plugin.getConfig().getIntegerParam("stunnel_write_high_water_bytes", 2 * 1024 * 1024);
+
         Bootstrap b = new Bootstrap();
         b.group(workerGroup)
                 .channel(NioSocketChannel.class)
                 .handler(new DstChannelInitializer(this, plugin, tunnelConfig, clientId, pm))
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .option(ChannelOption.TCP_NODELAY, true)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000);
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+                // Match the SRC side: large reads -> large broker messages, enlarged socket buffers.
+                .option(ChannelOption.SO_RCVBUF, sockBuf)
+                .option(ChannelOption.SO_SNDBUF, sockBuf)
+                .option(ChannelOption.RCVBUF_ALLOCATOR, new AdaptiveRecvByteBufAllocator(2048, 65536, readMax))
+                .option(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(writeHigh / 2, writeHigh));
 
         connectWithRetry(b, dstHost, dstPort, tunnelConfig, clientId, 3);
 

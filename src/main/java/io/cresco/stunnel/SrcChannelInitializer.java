@@ -146,15 +146,17 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 }
 
                 m.reset();
-                byte[] chunk = new byte[8192];
-                int n;
-                long total = 0L;
-                while ((n = m.readBytes(chunk)) > 0) {
-                    ByteBuf buf = ctx.alloc().buffer(n);
-                    buf.writeBytes(chunk, 0, n);
+                // Write the whole message body as ONE buffer. Re-chunking into 8KB writes cost
+                // 32x (alloc + copy + write + promise + listener) per 256KB message and was a
+                // primary stunnel throughput sink. Read once, wrap (no second copy), single write.
+                long bodyLen = m.getBodyLength();
+                if (bodyLen > 0) {
+                    byte[] data = new byte[(int) bodyLen];
+                    int read = m.readBytes(data);
+                    ByteBuf buf = Unpooled.wrappedBuffer(data, 0, read);
                     ChannelPromise p = ctx.newPromise();
                     pendingWrites++;
-                    ctx.write(buf, p);
+                    ctx.writeAndFlush(buf, p);
                     p.addListener(f -> {
                         if (!f.isSuccess()) {
                             logger.warn("Write failed for ClientID: " + clientId, f.cause());
@@ -163,10 +165,8 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                             maybeHalfClose(ctx);
                         }
                     });
-                    total += n;
+                    performanceMonitor.addBytes(read);
                 }
-                ctx.flush();
-                if (total > 0) performanceMonitor.addBytes(total);
 
             } else if (msg instanceof MapMessage) {
                 MapMessage statusMessage = (MapMessage) msg;
