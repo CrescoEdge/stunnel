@@ -62,12 +62,23 @@ public class SocketController {
     // should be evolved into a Map<String, SocketControllerSM> to track each tunnel's state.
     private final Map<String, SocketControllerSM> tunnelStateMachines = new ConcurrentHashMap<>();
 
+    // Live, dynamically-tunable I/O sizes (seeded from config). The controller's AutoTuner pushes a
+    // 'nettuning' CONFIG message that updates these; NEW tunnels/sessions read the current value at
+    // bootstrap, so buffer/block sizes track the fabric-wide tuning without a restart.
+    private final java.util.concurrent.atomic.AtomicInteger socketBufferBytes = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger readChunkBytes = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger writeHighWaterBytes = new java.util.concurrent.atomic.AtomicInteger();
 
     public SocketController(PluginBuilder plugin) {
         this.plugin = plugin;
         this.logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
         this.mapType = new TypeToken<Map<String, String>>() {}.getType();
         this.gson = new GsonBuilder().setPrettyPrinting().create();
+
+        // seed the live tunables from static config (defaults preserve current behavior)
+        this.socketBufferBytes.set(plugin.getConfig().getIntegerParam("stunnel_socket_buffer_bytes", 4 * 1024 * 1024));
+        this.readChunkBytes.set(plugin.getConfig().getIntegerParam("stunnel_read_chunk_bytes", 256 * 1024));
+        this.writeHighWaterBytes.set(plugin.getConfig().getIntegerParam("stunnel_write_high_water_bytes", 2 * 1024 * 1024));
 
         // Initialize Netty Event Loop Groups
         this.bossGroup = new NioEventLoopGroup(1); // For accepting connections
@@ -293,9 +304,9 @@ public class SocketController {
                 return false;
             }
 
-            int sockBuf = plugin.getConfig().getIntegerParam("stunnel_socket_buffer_bytes", 4 * 1024 * 1024);
-            int readMax = plugin.getConfig().getIntegerParam("stunnel_read_chunk_bytes", 256 * 1024);
-            int writeHigh = plugin.getConfig().getIntegerParam("stunnel_write_high_water_bytes", 2 * 1024 * 1024);
+            int sockBuf = socketBufferBytes.get();
+            int readMax = readChunkBytes.get();
+            int writeHigh = writeHighWaterBytes.get();
 
             ServerBootstrap b = new ServerBootstrap();
             b.group(bossGroup, workerGroup)
@@ -442,9 +453,9 @@ public class SocketController {
 
         logger.info("Attempting to create DST session for ClientID: " + clientId + " connecting to " + dstHost + ":" + dstPort);
 
-        int sockBuf = plugin.getConfig().getIntegerParam("stunnel_socket_buffer_bytes", 4 * 1024 * 1024);
-        int readMax = plugin.getConfig().getIntegerParam("stunnel_read_chunk_bytes", 256 * 1024);
-        int writeHigh = plugin.getConfig().getIntegerParam("stunnel_write_high_water_bytes", 2 * 1024 * 1024);
+        int sockBuf = socketBufferBytes.get();
+        int readMax = readChunkBytes.get();
+        int writeHigh = writeHighWaterBytes.get();
 
         Bootstrap b = new Bootstrap();
         b.group(workerGroup)
@@ -761,6 +772,23 @@ public class SocketController {
         performanceMonitors.clear();
 
         logger.info("SocketController shutdown complete.");
+    }
+
+    /**
+     * Apply a fabric-wide net-tuning update (from the controller AutoTuner's 'nettuning' CONFIG msg).
+     * Updates the live socket-buffer / read-block / write-watermark sizes; NEW tunnels and sessions
+     * read these at bootstrap, so buffer/block sizes track the tuning without a plugin restart.
+     */
+    public void applyNetTuning(Map<String, String> tuning) {
+        try {
+            if (tuning.containsKey("net_socket_buffer_bytes")) socketBufferBytes.set(Integer.parseInt(tuning.get("net_socket_buffer_bytes")));
+            if (tuning.containsKey("net_read_chunk_bytes")) readChunkBytes.set(Integer.parseInt(tuning.get("net_read_chunk_bytes")));
+            if (tuning.containsKey("net_write_high_water_bytes")) writeHighWaterBytes.set(Integer.parseInt(tuning.get("net_write_high_water_bytes")));
+            logger.info("applyNetTuning: sockBuf=" + socketBufferBytes.get() + " readChunk="
+                    + readChunkBytes.get() + " writeHi=" + writeHighWaterBytes.get());
+        } catch (Exception ex) {
+            logger.warn("applyNetTuning failed: " + ex.getMessage());
+        }
     }
 
     public Map<String, Map<String,String>> getActiveTunnels() {

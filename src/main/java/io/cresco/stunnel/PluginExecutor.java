@@ -44,6 +44,11 @@ public class PluginExecutor implements Executor {
                         return removeSrcTunnel(incoming);
                     case "removedsttunnel":
                         return removeDstTunnel(incoming);
+                    case "nettuning":
+                        // fabric-wide buffer/block-size tuning pushed by the controller AutoTuner
+                        socketController.applyNetTuning(incoming.getParams());
+                        incoming.setParam("status", "10");
+                        return incoming;
                     default:
                         logger.error("Unknown/Unsupported CONFIG action: {}", action);
                         incoming.setParam("status", "99");
