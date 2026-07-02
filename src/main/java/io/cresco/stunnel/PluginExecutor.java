@@ -6,7 +6,6 @@ import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
-import io.cresco.stunnel.state.SocketControllerSM;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -268,8 +267,7 @@ public class PluginExecutor implements Executor {
 
             for(String stunnelId : tunnels.keySet()) {
                 Map<String, String> tunnelInfo = new HashMap<>();
-                SocketControllerSM sm = socketController.getTunnelStateMachine(stunnelId);
-                String status = (sm != null) ? sm.getState().name() : "UNKNOWN";
+                String status = socketController.getTunnelStatus(stunnelId);
                 tunnelInfo.put("stunnel_id", stunnelId);
                 tunnelInfo.put("status", status);
                 tunnelList.add(tunnelInfo);
@@ -321,8 +319,7 @@ public class PluginExecutor implements Executor {
             if (stunnelId != null) {
                 Map<String, String> tunnelConfig = socketController.getTunnelConfig(stunnelId);
                 if (tunnelConfig != null) {
-                    SocketControllerSM sm = socketController.getTunnelStateMachine(stunnelId);
-                    String status = (sm != null) ? sm.getState().name() : "UNKNOWN";
+                    String status = socketController.getTunnelStatus(stunnelId);
                     incoming.setParam("stunnel_id", stunnelId);
                     incoming.setParam("tunnel_status", status);
                     incoming.setParam("status", "10");

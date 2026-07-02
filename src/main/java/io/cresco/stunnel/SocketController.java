@@ -749,4 +749,22 @@ public class SocketController {
         Map<String, String> config = activeTunnelsConfig.get(stunnelId);
         return (config != null) ? Collections.unmodifiableMap(config) : null;
     }
+
+    /**
+     * Real tunnel status derived from live controller state. The {@code SocketControllerSM} is never
+     * advanced (it always reads {@code pluginActive}), so status must come from the actual tunnel
+     * maps: a SRC tunnel is ACTIVE while its Netty listener channel is open, otherwise DOWN (i.e.
+     * reconnecting); a DST tunnel is an on-demand responder, so a present config means ACTIVE.
+     */
+    public String getTunnelStatus(String stunnelId) {
+        Map<String, String> config = activeTunnelsConfig.get(stunnelId);
+        if (config == null) {
+            return "UNKNOWN";
+        }
+        if (isSrcConfig(config)) {
+            Channel ch = activeServerChannels.get(stunnelId);
+            return (ch != null && ch.isActive()) ? "ACTIVE" : "DOWN";
+        }
+        return "ACTIVE";
+    }
 }
