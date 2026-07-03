@@ -2,6 +2,7 @@ package io.cresco.stunnel;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
+import io.cresco.library.capability.*;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
@@ -12,6 +13,75 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+@CrescoCapabilities(namespace = "stunnel", target = "plugin",
+        routingParams = {"region", "agent", "pluginid"},
+        summary = "Secure TCP tunnel plugin: forwards a local TCP port across the Cresco fabric to a remote host:port via a src/dst tunnel pair, with health checks and live metrics.")
+@CrescoActions({
+    @CrescoAction(name = "configsrctunnel", type = "CONFIG",
+        summary = "Create the source (listener) side of a TCP tunnel: opens a local port that forwards to a remote dst tunnel.",
+        why = "First step to expose a remote TCP service locally. Pair with configdsttunnel on the remote agent.",
+        params = @CrescoParam(name = "action_tunnel_config", required = true, compressed = true, type = "object",
+                description = "compressed JSON: {stunnel_id, src_port, dst_host, dst_port, dst_region, dst_agent, dst_plugin, ...}"),
+        returns = {
+            @CrescoReturn(name = "status", description = "10 success / 9 fail"),
+            @CrescoReturn(name = "stunnel_id", description = "the tunnel id"),
+            @CrescoReturn(name = "stunnel_config", type = "object", compressed = true, description = "the resolved tunnel config")
+        }),
+    @CrescoAction(name = "configdsttunnel", type = "CONFIG",
+        summary = "Configure the destination side of a TCP tunnel (the agent nearest the target host:port).",
+        why = "Second step; the dst side actually connects to the target service when a session opens.",
+        params = @CrescoParam(name = "action_tunnel_config", required = true, compressed = true, type = "object", description = "compressed JSON tunnel config"),
+        returns = @CrescoReturn(name = "status", description = "10 success / 9 fail")),
+    @CrescoAction(name = "configdstsession", type = "CONFIG",
+        summary = "Open a destination-side session (client connection) for an existing dst tunnel.",
+        why = "Internal per-connection setup; triggered when a client connects to the src listener.",
+        params = @CrescoParam(name = "action_session_config", required = true, compressed = true, type = "object", description = "compressed JSON: {stunnel_id, client_id}"),
+        returns = @CrescoReturn(name = "status", description = "10 success / 9 fail")),
+    @CrescoAction(name = "removesrctunnel", type = "CONFIG",
+        summary = "Tear down the source (listener) side of a tunnel.",
+        why = "Use to stop exposing a tunnel locally.",
+        params = @CrescoParam(name = "action_stunnel_id", required = true, description = "tunnel id"),
+        returns = @CrescoReturn(name = "status", description = "10 success / 9 fail")),
+    @CrescoAction(name = "removedsttunnel", type = "CONFIG",
+        summary = "Tear down the destination side of a tunnel.",
+        why = "Use to stop the remote end of a tunnel.",
+        params = @CrescoParam(name = "action_stunnel_id", required = true, description = "tunnel id"),
+        returns = @CrescoReturn(name = "status", description = "10 success / 9 fail")),
+    @CrescoAction(name = "nettuning", type = "CONFIG",
+        summary = "Apply fabric-wide network tuning (buffer/block sizes) to live tunnels.",
+        why = "Pushed by the controller AutoTuner to adapt tunnel I/O sizing under load.",
+        returns = @CrescoReturn(name = "status", description = "10 on success")),
+    @CrescoAction(name = "tunnelhealthcheck",
+        summary = "Check whether a tunnel config exists on this node.",
+        why = "Use to verify a tunnel is configured before relying on it.",
+        params = @CrescoParam(name = "action_stunnel_id", required = true, description = "tunnel id"),
+        returns = @CrescoReturn(name = "status", description = "10 found / 9 not found")),
+    @CrescoAction(name = "listtunnels",
+        summary = "List all active tunnels on this node with their live status.",
+        why = "Use to enumerate tunnels and their ACTIVE/RECOVERING/DOWN state.",
+        returns = @CrescoReturn(name = "tunnels", type = "array", description = "JSON array of {stunnel_id, status}")),
+    @CrescoAction(name = "gettunnelstatus",
+        summary = "Get the live status of one tunnel (ACTIVE/RECOVERING/DOWN/UNKNOWN).",
+        why = "Use to health-check a specific tunnel.",
+        params = @CrescoParam(name = "action_stunnel_id", required = true, description = "tunnel id"),
+        returns = {
+            @CrescoReturn(name = "stunnel_id", description = "the tunnel id"),
+            @CrescoReturn(name = "tunnel_status", description = "ACTIVE|RECOVERING|DOWN|UNKNOWN")
+        }),
+    @CrescoAction(name = "gettunnelconfig",
+        summary = "Get the full configuration of one tunnel.",
+        why = "Use to inspect a tunnel's src/dst wiring and tuning.",
+        params = @CrescoParam(name = "action_stunnel_id", required = true, description = "tunnel id"),
+        returns = @CrescoReturn(name = "tunnel_config", type = "object", description = "tunnel config JSON")),
+    @CrescoAction(name = "getmetrics",
+        summary = "Return live tunnel metrics (active tunnels/clients/targets) as MeasurementEngine gauges JSON.",
+        why = "Standard cross-bundle metrics contract; folded into getmetricinventory.",
+        returns = @CrescoReturn(name = "metrics", type = "object", description = "getAllMetrics() JSON")),
+    @CrescoAction(name = "getcapabilities",
+        summary = "Return this plugin's self-describing capability document (its message actions as LLM tool specs).",
+        why = "Discovery: lets a client/LLM learn what this plugin can do and how to call it.",
+        returns = @CrescoReturn(name = "capabilities", type = "object", description = "CapabilityDocument JSON"))
+})
 public class PluginExecutor implements Executor {
 
     private final PluginBuilder plugin;
@@ -88,6 +158,8 @@ public class PluginExecutor implements Executor {
                         incoming.setParam("metrics", socketController.getMetricsJson());
                         incoming.setParam("status", "10");
                         return incoming;
+                    case "getcapabilities":
+                        return CapabilityResponder.respond(incoming, this);
                     default:
                         logger.error("Unknown/Unsupported EXEC action: {}", action);
                         incoming.setParam("status", "99");
