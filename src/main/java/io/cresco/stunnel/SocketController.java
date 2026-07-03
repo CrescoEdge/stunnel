@@ -9,7 +9,6 @@ import io.cresco.library.metrics.CMetric;
 import io.cresco.library.metrics.MeasurementEngine;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
-import io.cresco.stunnel.state.SocketControllerSM;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.AdaptiveRecvByteBufAllocator;
@@ -59,10 +58,13 @@ public class SocketController {
     private final Map<String, Channel> activeTargetChannels = new ConcurrentHashMap<>(); // Map client_id -> Target Channel (dst)
     private final Map<String, ScheduledFuture<?>> activeHealthChecks = new ConcurrentHashMap<>();
 
-
-    // State machine for overall tunnel state. For a multi-tunnel environment, this
-    // should be evolved into a Map<String, SocketControllerSM> to track each tunnel's state.
-    private final Map<String, SocketControllerSM> tunnelStateMachines = new ConcurrentHashMap<>();
+    // NOTE: live tunnel status is derived from the real channel/config/health-check maps above
+    // (see getTunnelStatus). The UMPLE-generated io.cresco.stunnel.state.SocketControllerSM models
+    // the *intended* per-tunnel lifecycle (init/active/recovery/error/shutdown) but its guarded
+    // transitions were never driven, so it only ever read pluginActive. Rather than ship a
+    // half-wired FSM whose state silently diverges from reality, status is computed from ground
+    // truth; SocketControllerSM.java is retained purely as the lifecycle reference model for a
+    // future full FSM implementation (see docs — "wire the SM" is the effort-L alternative).
 
     // Live, dynamically-tunable I/O sizes (seeded from config). The controller's AutoTuner pushes a
     // 'nettuning' CONFIG message that updates these; NEW tunnels/sessions read the current value at
@@ -98,18 +100,6 @@ public class SocketController {
         logger.info("SocketController initialized with Netty EventLoopGroups.");
         checkStartUpConfig(); // Check for persisted config on startup
     }
-
-    // --- State Management ---
-    public void stateNotify(String stunnelId, String node) {
-        if(logger != null) {
-            logger.info("Tunnel [" + stunnelId + "] State Change: " + node);
-        }
-    }
-
-    public SocketControllerSM getTunnelStateMachine(String stunnelId) {
-        return tunnelStateMachines.computeIfAbsent(stunnelId, k -> new SocketControllerSM());
-    }
-
 
     // --- Tunnel Configuration Persistence ---
 
@@ -702,7 +692,6 @@ public class SocketController {
         if (pm != null) {
             pm.shutdown();
         }
-        tunnelStateMachines.remove(stunnelId);
         logger.info("SRC tunnel resource cleanup complete for: " + stunnelId);
     }
 
@@ -736,7 +725,6 @@ public class SocketController {
         if (pm != null) {
             pm.shutdown();
         }
-        tunnelStateMachines.remove(stunnelId);
         logger.info("DST tunnel resource cleanup complete for: " + stunnelId);
     }
 
@@ -825,10 +813,18 @@ public class SocketController {
     }
 
     /**
-     * Real tunnel status derived from live controller state. The {@code SocketControllerSM} is never
-     * advanced (it always reads {@code pluginActive}), so status must come from the actual tunnel
-     * maps: a SRC tunnel is ACTIVE while its Netty listener channel is open, otherwise DOWN (i.e.
-     * reconnecting); a DST tunnel is an on-demand responder, so a present config means ACTIVE.
+     * Real tunnel status derived from live controller state (not the decorative SocketControllerSM,
+     * which is never advanced). Ground truth comes from the actual tunnel maps:
+     * <ul>
+     *   <li>{@code UNKNOWN}  — no config for this id (never configured / already removed).</li>
+     *   <li>{@code ACTIVE}   — SRC listener channel is open, or a DST responder is configured.</li>
+     *   <li>{@code RECOVERING} — SRC config present, listener down, but a reconnect/health-check is
+     *       still scheduled (the ReconnectTask relentlessly re-establishes it).</li>
+     *   <li>{@code DOWN}     — SRC config present, listener down, nothing scheduled to recover it.</li>
+     * </ul>
+     * The channel state is authoritative: an open listener always reads ACTIVE. RECOVERING vs DOWN
+     * is distinguished from real scheduler state so callers see a truthful lifecycle rather than a
+     * single static value. (Full FSM lifecycle reporting is the effort-L SocketControllerSM path.)
      */
     public String getTunnelStatus(String stunnelId) {
         Map<String, String> config = activeTunnelsConfig.get(stunnelId);
@@ -837,7 +833,14 @@ public class SocketController {
         }
         if (isSrcConfig(config)) {
             Channel ch = activeServerChannels.get(stunnelId);
-            return (ch != null && ch.isActive()) ? "ACTIVE" : "DOWN";
+            if (ch != null && ch.isActive()) {
+                return "ACTIVE";
+            }
+            // Listener is down. If a reconnect is pending (health check scheduled, or a saved config
+            // the ReconnectTask will act on), the tunnel is actively recovering rather than dead.
+            boolean recovering = activeHealthChecks.containsKey(stunnelId)
+                    || (!scheduler.isShutdown() && getSavedTunnelConfig(stunnelId) != null);
+            return recovering ? "RECOVERING" : "DOWN";
         }
         return "ACTIVE";
     }
