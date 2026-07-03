@@ -5,6 +5,8 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import io.cresco.library.data.TopicType;
 import io.cresco.library.messaging.MsgEvent;
+import io.cresco.library.metrics.CMetric;
+import io.cresco.library.metrics.MeasurementEngine;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 import io.cresco.stunnel.state.SocketControllerSM;
@@ -69,6 +71,10 @@ public class SocketController {
     private final java.util.concurrent.atomic.AtomicInteger readChunkBytes = new java.util.concurrent.atomic.AtomicInteger();
     private final java.util.concurrent.atomic.AtomicInteger writeHighWaterBytes = new java.util.concurrent.atomic.AtomicInteger();
 
+    // B-2 metrics unification: one plugin-wide MeasurementEngine exposing stunnel's live counters via
+    // the standard getmetrics EXEC, so they fold into the controller's unified metric inventory.
+    private final MeasurementEngine metricEngine;
+
     public SocketController(PluginBuilder plugin) {
         this.plugin = plugin;
         this.logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
@@ -79,6 +85,11 @@ public class SocketController {
         this.socketBufferBytes.set(plugin.getConfig().getIntegerParam("stunnel_socket_buffer_bytes", 4 * 1024 * 1024));
         this.readChunkBytes.set(plugin.getConfig().getIntegerParam("stunnel_read_chunk_bytes", 256 * 1024));
         this.writeHighWaterBytes.set(plugin.getConfig().getIntegerParam("stunnel_write_high_water_bytes", 2 * 1024 * 1024));
+
+        this.metricEngine = new MeasurementEngine(plugin);
+        this.metricEngine.setGauge("stunnel.active.tunnels", "active SRC tunnel listeners", "stunnel", CMetric.MeasureClass.GAUGE_INT);
+        this.metricEngine.setGauge("stunnel.active.clients", "active client channels", "stunnel", CMetric.MeasureClass.GAUGE_INT);
+        this.metricEngine.setGauge("stunnel.active.targets", "active target channels", "stunnel", CMetric.MeasureClass.GAUGE_INT);
 
         // Initialize Netty Event Loop Groups
         this.bossGroup = new NioEventLoopGroup(1); // For accepting connections
@@ -788,6 +799,19 @@ public class SocketController {
                     + readChunkBytes.get() + " writeHi=" + writeHighWaterBytes.get());
         } catch (Exception ex) {
             logger.warn("applyNetTuning failed: " + ex.getMessage());
+        }
+    }
+
+    /** Current stunnel metrics as grouped JSON, for the controller's unified metric inventory (getmetrics). */
+    public String getMetricsJson() {
+        try {
+            metricEngine.updateIntGauge("stunnel.active.tunnels", activeServerChannels.size());
+            metricEngine.updateIntGauge("stunnel.active.clients", activeClientChannels.size());
+            metricEngine.updateIntGauge("stunnel.active.targets", activeTargetChannels.size());
+            return gson.toJson(metricEngine.getAllMetrics());
+        } catch (Exception ex) {
+            logger.error("getMetricsJson", ex);
+            return "{}";
         }
     }
 

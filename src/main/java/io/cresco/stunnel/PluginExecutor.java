@@ -83,6 +83,11 @@ public class PluginExecutor implements Executor {
                         return getTunnelStatus(incoming);
                     case "gettunnelconfig":
                         return getTunnelConfig(incoming);
+                    case "getmetrics":
+                        // unified metrics inventory: return this plugin's live metrics as JSON
+                        incoming.setParam("metrics", socketController.getMetricsJson());
+                        incoming.setParam("status", "10");
+                        return incoming;
                     default:
                         logger.error("Unknown/Unsupported EXEC action: {}", action);
                         incoming.setParam("status", "99");
