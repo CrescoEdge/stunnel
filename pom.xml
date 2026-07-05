@@ -54,7 +54,7 @@
 
     <properties>
         <!-- jdk, encoding, plugin & OSGi API / gson versions inherited from cresco-parent -->
-        <netty.version>4.1.116.Final</netty.version>
+        <netty.version>4.1.135.Final</netty.version>
     </properties>
 
     <dependencies>
