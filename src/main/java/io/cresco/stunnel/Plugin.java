@@ -6,11 +6,15 @@ import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.plugin.PluginService;
 import io.cresco.library.utilities.CLogger;
+import org.apache.felix.hc.api.HealthCheck;
 import org.osgi.framework.BundleContext;
+import org.osgi.framework.ServiceRegistration;
 import org.osgi.service.component.annotations.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Dictionary;
+import java.util.Hashtable;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -36,6 +40,8 @@ public class Plugin implements PluginService {
     private Map<String,Object> map;
     // The core controller, now using Netty
     private SocketController socketController;
+    // Felix HealthCheck registration (central health); best-effort, unregistered on stop
+    private ServiceRegistration<HealthCheck> healthReg;
 
     // FIX: Use an AtomicBoolean to safely track the plugin's active state.
     // This avoids NullPointerExceptions during shutdown race conditions.
@@ -132,6 +138,14 @@ public class Plugin implements PluginService {
 
                 // FIX: Set the internal state flag to true upon successful startup.
                 this.isActive.set(true);
+                // Also reflect active state on the PluginBuilder like every other Cresco plugin, so
+                // pluginBuilder.isActive() is truthful (the framework + the central HealthCheck rely
+                // on it). Previously stunnel tracked liveness ONLY via the private AtomicBoolean, so
+                // pluginBuilder.isActive() stayed false and health checks read the plugin as down.
+                pluginBuilder.setIsActive(true);
+
+                // Register the central Felix HealthCheck (best-effort; must never break startup).
+                registerHealthCheck();
             }
             return this.isActive.get(); // Return the state from our flag
         } catch (Exception ex) {
@@ -144,6 +158,21 @@ public class Plugin implements PluginService {
             // Ensure cleanup if startup fails partially
             isStopped();
             return false; // Indicate startup failure
+        }
+    }
+
+    /** Register stunnel's Felix HealthCheck so CrescoHealthExecutor discovers it. Best-effort. */
+    private void registerHealthCheck() {
+        try {
+            Dictionary<String, Object> props = new Hashtable<>();
+            props.put(HealthCheck.NAME, "stunnel");
+            props.put(HealthCheck.TAGS, new String[]{"local"});
+            healthReg = context.registerService(HealthCheck.class,
+                    new StunnelHealthCheck(pluginBuilder, socketController), props);
+            logger.info("Registered stunnel HealthCheck (Felix HC)");
+        } catch (Throwable t) {
+            // health is best-effort: a missing hc.api bundle must never break stunnel
+            if (logger != null) logger.warn("Could not register stunnel HealthCheck: " + t.getMessage());
         }
     }
 
@@ -160,6 +189,15 @@ public class Plugin implements PluginService {
 
         // Set internal state to inactive
         this.isActive.set(false);
+        // Keep the PluginBuilder's active flag in sync (null-safe: it may already be torn down).
+        if (pluginBuilder != null) {
+            try { pluginBuilder.setIsActive(false); } catch (Exception ignore) { }
+        }
+
+        // Unregister the central HealthCheck (best-effort)
+        try {
+            if (healthReg != null) { healthReg.unregister(); healthReg = null; }
+        } catch (Exception ignore) { }
 
         // Safely shut down the socket controller if it exists
         if (socketController != null) {

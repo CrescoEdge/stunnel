@@ -2,10 +2,8 @@ package io.cresco.stunnel;
 
 import com.google.gson.Gson;
 import io.cresco.library.data.TopicType;
-import io.cresco.library.metrics.MeasurementEngine;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
-import io.micrometer.core.instrument.DistributionSummary;
 import jakarta.jms.DeliveryMode;
 import jakarta.jms.TextMessage;
 
@@ -28,7 +26,6 @@ public class PerformanceMonitor {
     private final CLogger logger;
     private final Map<String, String> tunnelConfig;
     private final String direction;
-    private final String metricName;
     private final Gson gson;
 
     // Performance tracking objects
@@ -45,7 +42,6 @@ public class PerformanceMonitor {
     private final int bufferSize;
 
     // Metrics and scheduling
-    private DistributionSummary bytesPerSecond;
     private final ScheduledExecutorService scheduler;
     private volatile boolean isHealthy;
 
@@ -68,7 +64,6 @@ public class PerformanceMonitor {
         this.logger = plugin.getLogger(this.getClass().getName(), CLogger.Level.Info);
         this.tunnelConfig = tunnelConfig;
         this.direction = direction;
-        this.metricName = metricName;
         this.gson = new Gson();
 
         // Initialize measuring objects
@@ -105,9 +100,6 @@ public class PerformanceMonitor {
                 ", bufferSize=" + bufferSize +
                 ", reportingInterval=" + reportingIntervalMs + "ms");
 
-        // Initialize metrics
-        initPerformanceMetrics();
-
         // Create named thread pool for scheduler - no final modifier for OSGi
         this.scheduler = Executors.newScheduledThreadPool(1, r -> {
             Thread t = new Thread(r, "PerfMonitor-" + direction + "-" + tunnelConfig.get("stunnel_id"));
@@ -118,24 +110,6 @@ public class PerformanceMonitor {
         // Schedule reporting task
         scheduler.scheduleAtFixedRate(
                 new PerformanceReporterTask(), 1, reportingIntervalMs, TimeUnit.MILLISECONDS);
-    }
-
-    /**
-     * Initialize the performance metrics with Micrometer
-     */
-    private void initPerformanceMetrics() {
-        try {
-            MeasurementEngine me = new MeasurementEngine(plugin);
-
-            bytesPerSecond = DistributionSummary
-                    .builder(metricName)
-                    .baseUnit("bytes")
-                    .description("Bytes transferred per second")
-                    .register(me.getCrescoMeterRegistry());
-
-        } catch (Exception ex) {
-            logger.error("Failed to initialize PerformanceMetrics", ex);
-        }
     }
 
     /**
@@ -157,11 +131,10 @@ public class PerformanceMonitor {
         // Update the activity timestamp every time data is processed
         lastActivityTimeMs.set(System.currentTimeMillis());
 
-        // Add to the adder for thread-safe accumulation
+        // Add to the adder for thread-safe accumulation. (The plugin's canonical, inventory-visible
+        // metrics live on SocketController's MeasurementEngine — active tunnel/client/target gauges
+        // exposed via getmetrics; per-tunnel throughput is streamed as dataplane "stats" below.)
         bytesAdder.add(byteCount);
-
-        // Record in metrics registry
-        bytesPerSecond.record(byteCount);
 
         if (debugMode && byteCount > bufferSize) {
             logger.debug("Large byte count added: " + byteCount + " bytes in " + direction);
