@@ -44,6 +44,12 @@ public class PerformanceMonitor {
     // Metrics and scheduling
     private final ScheduledExecutorService scheduler;
     private volatile boolean isHealthy;
+    // Latest observed broker hop path for this direction (comma-separated region_agent), stamped by the
+    // CrescoTraceBroker at each hop and read off arriving tunnel messages.
+    private volatile String hops;
+
+    /** Record the broker path a tunnel message crossed (from its cresco_hops property). */
+    public void setHops(String h) { if (h != null && !h.isEmpty()) this.hops = h; }
 
     // Debugging configuration
     private final boolean debugMode;
@@ -240,6 +246,8 @@ public class PerformanceMonitor {
                 updatePerformanceMessage.setStringProperty("stunnel_id", tunnelConfig.get("stunnel_id"));
                 updatePerformanceMessage.setStringProperty("direction", direction);
                 updatePerformanceMessage.setStringProperty("type", "stats");
+                // clean selector for subscribers (dashboard) — this IS the pushed, subscribable trace stream
+                updatePerformanceMessage.setStringProperty("cresco_msg_type", "stunnel_trace");
 
                 // Create metrics map with only bits per second - standard for networking
                 Map<String, String> performanceMetrics = new HashMap<>();
@@ -256,6 +264,14 @@ public class PerformanceMonitor {
                 performanceMetrics.put("is_healthy", String.valueOf(isHealthy));
                 performanceMetrics.put("elapsed_time", String.format("%.3f", elapsedSeconds));
                 performanceMetrics.put("buffer_size", String.valueOf(bufferSize));
+                // HOP PATH: the ordered broker path this direction's bytes crossed (stamped by CrescoTraceBroker
+                // at each hop, read off the arriving messages). This is the end-to-end trace, pushed live.
+                if (hops != null) performanceMetrics.put("hops", hops);
+                // tunnel endpoints, so a subscriber can place the path without extra lookups
+                if (tunnelConfig.get("src_region") != null) performanceMetrics.put("src_region", tunnelConfig.get("src_region"));
+                if (tunnelConfig.get("src_agent")  != null) performanceMetrics.put("src_agent",  tunnelConfig.get("src_agent"));
+                if (tunnelConfig.get("dst_region") != null) performanceMetrics.put("dst_region", tunnelConfig.get("dst_region"));
+                if (tunnelConfig.get("dst_agent")  != null) performanceMetrics.put("dst_agent",  tunnelConfig.get("dst_agent"));
 
                 String performanceMetricsJson = gson.toJson(performanceMetrics);
                 updatePerformanceMessage.setText(performanceMetricsJson);

@@ -135,6 +135,8 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
         try {
             if (msg instanceof BytesMessage) {
                 BytesMessage m = (BytesMessage) msg;
+                // HOP TRACE: brokers stamped the DST->SRC broker path onto cresco_hops as this arrived.
+                if (m.propertyExists("cresco_hops")) performanceMonitor.setHops(m.getStringProperty("cresco_hops"));
                 boolean eos = m.propertyExists("eos") && m.getBooleanProperty("eos");
 
                 if (eos) {
@@ -228,6 +230,7 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             bytesMessage.setStringProperty("stunnel_id", this.stunnelId);
             bytesMessage.setStringProperty("direction", "dst");
             bytesMessage.setStringProperty("client_id", this.clientId);
+            bytesMessage.setStringProperty("cresco_trace", "1");   // brokers stamp cresco_hops as it transits
             byte[] data = new byte[bytesRead];
             in.readBytes(data);
             bytesMessage.writeBytes(data);

@@ -99,7 +99,47 @@ public class SocketController {
 
         logger.info("SocketController initialized with Netty EventLoopGroups.");
         checkStartUpConfig(); // Check for persisted config on startup
+
+        // EXISTENCE BEACON: push each configured tunnel's identity + status on the subscribable
+        // stunnel_trace stream every few seconds, so a subscriber (dashboard) knows a tunnel EXISTS —
+        // active or not — even with zero traffic. Traffic traces (hops + throughput) come separately
+        // from the per-session PerformanceMonitor.
+        long beaconMs = plugin.getConfig().getLongParam("stunnel_beacon_ms", 3000L);
+        scheduler.scheduleAtFixedRate(this::publishTunnelBeacons, beaconMs, beaconMs, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
+
+    /** Push one status beacon per SRC-configured tunnel on the subscribable stunnel_trace stream. */
+    private void publishTunnelBeacons() {
+        try {
+            for (Map.Entry<String, Map<String, String>> e : activeTunnelsConfig.entrySet()) {
+                Map<String, String> cfg = e.getValue();
+                if (cfg == null || !isSrcConfig(cfg)) continue;   // beacon from the SRC side only
+                String sid = e.getKey();
+                boolean listening = activeServerChannels.containsKey(sid)
+                        && activeServerChannels.get(sid) != null && activeServerChannels.get(sid).isActive();
+                Map<String, String> b = new java.util.HashMap<>();
+                b.put("stunnel_id", sid);
+                b.put("type", "tunnel");
+                b.put("status", listening ? "ACTIVE" : "INACTIVE");
+                b.put("src_region", cfg.get("src_region")); b.put("src_agent", cfg.get("src_agent"));
+                b.put("dst_region", cfg.get("dst_region")); b.put("dst_agent", cfg.get("dst_agent"));
+                b.put("src_port", cfg.get("src_port"));
+                b.put("dst_host", cfg.get("dst_host")); b.put("dst_port", cfg.get("dst_port"));
+                b.put("clients", String.valueOf(activeClientChannels.size()));
+                jakarta.jms.TextMessage tm = plugin.getAgentService().getDataPlaneService().createTextMessage();
+                tm.setStringProperty("stunnel_id", sid);
+                tm.setStringProperty("type", "tunnel");
+                tm.setStringProperty("cresco_msg_type", "stunnel_trace");
+                tm.setText(new com.google.gson.Gson().toJson(b));
+                plugin.getAgentService().getDataPlaneService().sendMessage(
+                        io.cresco.library.data.TopicType.GLOBAL, tm,
+                        jakarta.jms.DeliveryMode.NON_PERSISTENT, 0, (int) (beaconMsTtl()));
+            }
+        } catch (Exception ex) {
+            logger.debug("publishTunnelBeacons error: " + ex.getMessage());
+        }
+    }
+    private long beaconMsTtl() { return plugin.getConfig().getLongParam("stunnel_beacon_ms", 3000L) * 4; }
 
     // --- Tunnel Configuration Persistence ---
 
