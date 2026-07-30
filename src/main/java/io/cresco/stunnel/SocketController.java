@@ -293,7 +293,50 @@ public class SocketController {
 
     // --- Netty Tunnel Creation ---
 
+    // Resolve the io.cresco.stunnel plugin id on an agent via the global controller's
+    // registration state (reliable, no per-agent RPC). Returns null if not found.
+    private String resolveStunnelPlugin(String dstRegion, String dstAgent) {
+        try {
+            MsgEvent req = plugin.getGlobalControllerMsgEvent(MsgEvent.Type.EXEC);
+            req.setParam("action", "listplugins");
+            req.setParam("action_region", dstRegion);
+            req.setParam("action_agent", dstAgent);
+            MsgEvent resp = plugin.sendRPC(req);
+            if (resp == null) return null;
+            String listStr = resp.getCompressedParam("pluginslist");
+            if (listStr == null) return null;
+            Map<?, ?> parsed = gson.fromJson(listStr, Map.class);
+            Object plugins = parsed.get("plugins");
+            if (plugins instanceof List) {
+                for (Object o : (List<?>) plugins) {
+                    if (o instanceof Map) {
+                        Map<?, ?> pm = (Map<?, ?>) o;
+                        if ("io.cresco.stunnel".equals(pm.get("pluginname"))) {
+                            Object name = pm.get("name");
+                            if (name != null) return name.toString();
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Failed to resolve dst stunnel plugin for " + dstRegion + "/" + dstAgent + ": " + e.getMessage());
+        }
+        return null;
+    }
+
     public String startSrcTunnel(Map<String, String> tunnelConfig) {
+        // Auto-resolve the destination stunnel plugin from the global controller when omitted,
+        // so callers only need dst_region/dst_agent (no client-side plugin-id discovery).
+        String dstPluginArg = tunnelConfig.get("dst_plugin");
+        if ((dstPluginArg == null || dstPluginArg.isEmpty())
+                && tunnelConfig.get("dst_region") != null && tunnelConfig.get("dst_agent") != null) {
+            String resolved = resolveStunnelPlugin(tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"));
+            if (resolved != null) {
+                tunnelConfig.put("dst_plugin", resolved);
+                logger.info("Resolved dst stunnel plugin for " + tunnelConfig.get("dst_region") + "/"
+                        + tunnelConfig.get("dst_agent") + " -> " + resolved);
+            }
+        }
         if (!validateTunnelConfig(tunnelConfig)) {
             logger.error("Cannot create src tunnel: Invalid configuration provided.");
             return null;
@@ -691,6 +734,10 @@ public class SocketController {
     public void removeSrcTunnel(String stunnelId) {
         logger.info("Removing SRC tunnel: " + stunnelId);
 
+        // Capture the dst coordinates before the config is deleted so we can cascade the
+        // teardown to the paired DST tunnel (otherwise it is orphaned on the remote agent).
+        Map<String, String> removedConfig = activeTunnelsConfig.get(stunnelId);
+
         // This is the crucial step that prevents reconnection.
         deleteTunnelConfig(stunnelId);
 
@@ -702,6 +749,26 @@ public class SocketController {
         } else {
             // If channel is already closed, we still need to clean up resources
             cleanupSrcTunnelResources(stunnelId);
+        }
+
+        // Cascade: tell the paired DST tunnel to tear down too, so it is not left orphaned.
+        cascadeRemoveDst(stunnelId, removedConfig);
+    }
+
+    private void cascadeRemoveDst(String stunnelId, Map<String, String> cfg) {
+        if (cfg == null) return;
+        String dstRegion = cfg.get("dst_region");
+        String dstAgent = cfg.get("dst_agent");
+        String dstPlugin = cfg.get("dst_plugin");
+        if (dstRegion == null || dstAgent == null || dstPlugin == null) return;
+        try {
+            MsgEvent req = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG, dstRegion, dstAgent, dstPlugin);
+            req.setParam("action", "removedsttunnel");
+            req.setParam("action_stunnel_id", stunnelId);
+            plugin.msgOut(req);
+            logger.info("Cascade teardown: sent removedsttunnel for " + stunnelId + " to " + dstRegion + "/" + dstAgent);
+        } catch (Exception e) {
+            logger.error("Cascade removedsttunnel failed for " + stunnelId + ": " + e.getMessage());
         }
     }
 
