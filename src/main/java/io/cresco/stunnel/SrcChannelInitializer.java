@@ -62,6 +62,7 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private volatile boolean gracefulCloseInitiatedByDst = false;
     private volatile boolean eosSeen = false;
     private volatile boolean outputShutdown = false;
+    private volatile boolean eosSentToDst = false;
     private long pendingWrites = 0;
     private static final long EOS_TIMEOUT_MS = 5000;
     private io.netty.util.concurrent.ScheduledFuture<?> eosTimeout;
@@ -86,33 +87,82 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             ctx.close();
             return;
         }
-        initiateDstSession(ctx, currentTunnelConfig);
-    }
-
-    private void initiateDstSession(ChannelHandlerContext ctx, Map<String, String> currentTunnelConfig) {
-        MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG,
-                currentTunnelConfig.get("dst_region"),
-                currentTunnelConfig.get("dst_agent"),
-                currentTunnelConfig.get("dst_plugin"));
-        request.setParam("action", "configdstsession");
-        Map<String, String> sessionConfig = new java.util.HashMap<>();
-        sessionConfig.put("stunnel_id", stunnelId);
-        sessionConfig.put("client_id", clientId);
-        Gson gson = new Gson();
-        request.setParam("action_session_config", gson.toJson(sessionConfig));
-        MsgEvent response = plugin.sendRPC(request);
-
-        if (response != null && "10".equals(response.getParam("status"))) {
-            logger.info("DST session initiation request successful for ClientID: " + clientId);
-            setupJmsListener(ctx);
-        } else {
-            logger.error("Failed to initiate DST session for ClientID: " + clientId + ". Closing SRC connection. Response: "
-                    + (response != null ? response.getParams() : "null"));
+        // Blocking the event loop on the init RPC froze every other client on this loop thread for
+        // the RPC timeout and suppressed the tunnel's traffic-based proof-of-life. Hold reads until
+        // the DST session is confirmed (preserving the no-forwarding-before-init ordering), and run
+        // the RPC off-loop. The slot bound keeps a connect burst during a fabric stall from parking
+        // an unbounded number of init threads; over-bound connects fail fast.
+        ctx.channel().config().setAutoRead(false);
+        if (!socketController.tryAcquireDstInitSlot()) {
+            logger.error("DST session initiation rejected for ClientID: " + clientId + ": too many concurrent initiations. Closing SRC connection.");
+            ctx.close();
+            return;
+        }
+        try {
+            socketController.getDstInitExecutor().execute(() -> initiateDstSession(ctx, currentTunnelConfig));
+        } catch (Throwable t) {
+            socketController.releaseDstInitSlot();
+            logger.error("Failed to submit DST session initiation for ClientID: " + clientId + ". Closing SRC connection.", t);
             ctx.close();
         }
     }
 
-    private void setupJmsListener(ChannelHandlerContext ctx) {
+    private void initiateDstSession(ChannelHandlerContext ctx, Map<String, String> currentTunnelConfig) {
+        // Any throw on this off-loop thread would otherwise leave the channel frozen forever:
+        // open, autoRead(false), no listener, never closed (exceptionCaught only covers pipeline
+        // threads). Fail closed instead.
+        try {
+            // Attach our return-path listener BEFORE the RPC: the DST only starts publishing
+            // direction='src' traffic (e.g. a server-speaks-first banner) after it receives this
+            // request, so subscribing first guarantees nothing from the target can be dropped.
+            if (!setupJmsListener(ctx)) {
+                ctx.close();
+                return;
+            }
+
+            MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.CONFIG,
+                    currentTunnelConfig.get("dst_region"),
+                    currentTunnelConfig.get("dst_agent"),
+                    currentTunnelConfig.get("dst_plugin"));
+            if (request == null) {
+                // PluginBuilder returns null when the agent service is transiently unavailable
+                logger.error("Failed to build DST session request for ClientID: " + clientId + ". Closing SRC connection.");
+                ctx.close();
+                return;
+            }
+            request.setParam("action", "configdstsession");
+            Map<String, String> sessionConfig = new java.util.HashMap<>();
+            sessionConfig.put("stunnel_id", stunnelId);
+            sessionConfig.put("client_id", clientId);
+            Gson gson = new Gson();
+            request.setParam("action_session_config", gson.toJson(sessionConfig));
+            MsgEvent response = plugin.sendRPC(request, socketController.getDstInitTimeoutMs());
+
+            ctx.channel().eventLoop().execute(() -> {
+                if (!ctx.channel().isActive()) {
+                    // Client went away while the RPC was in flight; channelInactive has already
+                    // notified the DST side to release any session it may have opened.
+                    logger.info("SRC channel closed during DST session initiation for ClientID: " + clientId);
+                    return;
+                }
+                if (response != null && "10".equals(response.getParam("status"))) {
+                    logger.info("DST session initiation request successful for ClientID: " + clientId);
+                    ctx.channel().config().setAutoRead(true);
+                } else {
+                    logger.error("Failed to initiate DST session for ClientID: " + clientId + ". Closing SRC connection. Response: "
+                            + (response != null ? response.getParams() : "null"));
+                    ctx.close();
+                }
+            });
+        } catch (Throwable t) {
+            logger.error("DST session initiation failed for ClientID: " + clientId + ". Closing SRC connection.", t);
+            ctx.close();
+        } finally {
+            socketController.releaseDstInitSlot();
+        }
+    }
+
+    private boolean setupJmsListener(ChannelHandlerContext ctx) {
         try {
             MessageListener ml = msg -> {
                 if (ctx.channel().eventLoop().inEventLoop()) {
@@ -123,9 +173,10 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             };
             String queryString = String.format("stunnel_id='%s' AND client_id='%s' AND direction='src'", this.stunnelId, this.clientId);
             this.jmsListenerId = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL, ml, queryString);
+            return true;
         } catch (Exception e) {
             logger.error("Failed to setup JMS listener for ClientID: " + clientId + ". Closing connection.", e);
-            ctx.close();
+            return false;
         }
     }
 
@@ -208,7 +259,12 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 .addListener(f -> {
                     if (f.isSuccess()) {
                         try {
-                            ((SocketChannel) ctx.channel()).shutdownOutput().addListener(ChannelFutureListener.CLOSE_ON_FAILURE);
+                            ((SocketChannel) ctx.channel()).shutdownOutput().addListener(sf -> {
+                                // both directions done -> full close (channelInactive cleans up)
+                                if (!sf.isSuccess() || ((SocketChannel) ctx.channel()).isInputShutdown()) {
+                                    ctx.close();
+                                }
+                            });
                             logger.debug("shutdownOutput sent for ClientID: " + clientId);
                         } catch (Throwable t) {
                             logger.warn("shutdownOutput failed for ClientID: " + clientId, t);
@@ -218,6 +274,24 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         ctx.close();
                     }
                 });
+    }
+
+    @Override
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+        if (evt instanceof io.netty.channel.socket.ChannelInputShutdownEvent) {
+            // allowHalfClosure(true) turns a client EOF into this event INSTEAD of channelInactive.
+            // Ignoring it (the old behavior) meant a client-initiated close never propagated: no
+            // EOS to the DST, target never released, session half-open until tunnel teardown.
+            // Relay the half-close: EOS lets the DST FIN the target after drain; keep this channel
+            // open for remaining DST->SRC data unless our write side is already shut too.
+            logger.debug("Client input shutdown (EOF) for ClientID: " + clientId);
+            sendEosToDst();
+            if (outputShutdown) {
+                ctx.close();
+            }
+        } else {
+            super.userEventTriggered(ctx, evt);
+        }
     }
 
     @Override
@@ -244,11 +318,32 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (eosTimeout != null) { eosTimeout.cancel(false); eosTimeout = null; }
         if (this.clientId != null) socketController.removeClientChannel(this.clientId);
 
-        if (this.jmsListenerId != null) {
-            if (!gracefulCloseInitiatedByDst) {
-                notifyDstOfClose();
-            }
-            removeJmsListener();
+        // Notify the DST side even when no JMS listener was ever set up (init RPC failed or still
+        // in flight): the configdstsession CONFIG is persistent and can be delivered late, so the
+        // DST may open (or hold) a target connection for this already-dead client otherwise.
+        // EOS first (mirrors the DST's close path): without it the DST sat in its 5s EOS timeout
+        // and tore the session down as an error on every client-initiated close.
+        if (!gracefulCloseInitiatedByDst && this.clientId != null && this.stunnelId != null) {
+            sendEosToDst();
+            notifyDstOfClose();
+        }
+        removeJmsListener();
+    }
+
+    private void sendEosToDst() {
+        if (eosSentToDst) return;
+        eosSentToDst = true;
+        try {
+            BytesMessage eos = plugin.getAgentService().getDataPlaneService().createBytesMessage();
+            eos.setJMSPriority(0);
+            eos.setStringProperty("stunnel_id", stunnelId);
+            eos.setStringProperty("direction", "dst");
+            eos.setStringProperty("client_id", clientId);
+            eos.setBooleanProperty("eos", true);
+            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, eos);
+            logger.debug("EOS sent to DST for ClientID: " + clientId);
+        } catch (Exception e) {
+            logger.error("Failed to send EOS to DST for ClientID: " + clientId, e);
         }
     }
 

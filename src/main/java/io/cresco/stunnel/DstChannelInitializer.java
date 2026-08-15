@@ -24,13 +24,15 @@ public class DstChannelInitializer extends ChannelInitializer<SocketChannel> {
     private final Map<String, String> tunnelConfig;
     private final String clientId;
     private final PerformanceMonitor performanceMonitor;
+    private final DstSessionRelay relay;
 
-    public DstChannelInitializer(SocketController sc, PluginBuilder pb, Map<String, String> tc, String clientId, PerformanceMonitor pm) {
+    public DstChannelInitializer(SocketController sc, PluginBuilder pb, Map<String, String> tc, String clientId, PerformanceMonitor pm, DstSessionRelay relay) {
         this.socketController = sc;
         this.plugin = pb;
         this.tunnelConfig = tc;
         this.clientId = clientId;
         this.performanceMonitor = pm;
+        this.relay = relay;
     }
 
     @Override
@@ -40,7 +42,7 @@ public class DstChannelInitializer extends ChannelInitializer<SocketChannel> {
         ch.config().setAllowHalfClosure(true);
         ch.attr(SrcChannelInitializer.CLIENT_ID_KEY).set(clientId);
         ch.attr(SrcChannelInitializer.STUNNEL_ID_KEY).set(stunnelId);
-        p.addLast(new DstSessionHandler(socketController, plugin, performanceMonitor));
+        p.addLast(new DstSessionHandler(socketController, plugin, performanceMonitor, relay));
     }
 }
 
@@ -49,23 +51,25 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private final SocketController socketController;
     private final PluginBuilder plugin;
     private final PerformanceMonitor performanceMonitor;
+    private final DstSessionRelay relay;
     private final CLogger logger;
     private String clientId;
     private String stunnelId;
-    private String jmsListenerId;
     private boolean exceptionHandled = false;
 
     private volatile boolean gracefulCloseInitiatedBySrc = false;
     private volatile boolean eosSeen = false;
     private volatile boolean outputShutdown = false;
+    private volatile boolean eosSentToSrc = false;
     private long pendingWrites = 0;
     private static final long EOS_TIMEOUT_MS = 5000;
     private ScheduledFuture<?> eosTimeout;
 
-    public DstSessionHandler(SocketController sc, PluginBuilder pb, PerformanceMonitor pm) {
+    public DstSessionHandler(SocketController sc, PluginBuilder pb, PerformanceMonitor pm, DstSessionRelay relay) {
         this.socketController = sc;
         this.plugin = pb;
         this.performanceMonitor = pm;
+        this.relay = relay;
         this.logger = plugin.getLogger(getClass().getName(), CLogger.Level.Info);
     }
 
@@ -74,26 +78,18 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
         this.clientId = ctx.channel().attr(SrcChannelInitializer.CLIENT_ID_KEY).get();
         this.stunnelId = ctx.channel().attr(SrcChannelInitializer.STUNNEL_ID_KEY).get();
         socketController.addTargetChannel(clientId, ctx.channel());
+        socketController.clearPendingDstRelay(clientId);
         logger.info("DST Channel Active (to target): " + ctx.channel().remoteAddress() + ", ClientID: " + clientId + ", StunnelID: " + stunnelId);
-        setupJmsListener(ctx);
-    }
-
-    private void setupJmsListener(ChannelHandlerContext ctx) {
-        try {
-            MessageListener ml = msg -> {
-                if (ctx.channel().eventLoop().inEventLoop()) {
-                    processJmsMessage(ctx, msg);
-                } else {
-                    ctx.channel().eventLoop().execute(() -> processJmsMessage(ctx, msg));
-                }
-            };
-            String queryString = String.format("stunnel_id='%s' AND client_id='%s' AND direction='dst'", this.stunnelId, this.clientId);
-            this.jmsListenerId = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL, ml, queryString);
-        } catch (Exception e) {
-            logger.error("Failed to setup JMS listener for ClientID: " + clientId + " on DST side. Closing connection.", e);
-            notifySrcOfError(e);
-            ctx.close();
-        }
+        // The relay was subscribed before the connect was initiated (so the SRC's first bytes
+        // could not race the listener attach); drain anything it buffered and go live.
+        MessageListener ml = msg -> {
+            if (ctx.channel().eventLoop().inEventLoop()) {
+                processJmsMessage(ctx, msg);
+            } else {
+                ctx.channel().eventLoop().execute(() -> processJmsMessage(ctx, msg));
+            }
+        };
+        relay.activate(ml);
     }
 
     private void processJmsMessage(ChannelHandlerContext ctx, Message msg) {
@@ -170,7 +166,12 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 .addListener(f -> {
                     if (f.isSuccess()) {
                         try {
-                            ((SocketChannel) ctx.channel()).shutdownOutput().addListener(ChannelFutureListener.CLOSE_ON_FAILURE);
+                            ((SocketChannel) ctx.channel()).shutdownOutput().addListener(sf -> {
+                                // both directions done -> full close (channelInactive cleans up)
+                                if (!sf.isSuccess() || ((SocketChannel) ctx.channel()).isInputShutdown()) {
+                                    ctx.close();
+                                }
+                            });
                             logger.debug("shutdownOutput sent for ClientID: " + clientId);
                         } catch (Throwable t) {
                             logger.warn("shutdownOutput failed for ClientID: " + clientId, t);
@@ -180,6 +181,22 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         ctx.close();
                     }
                 });
+    }
+
+    @Override
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+        if (evt instanceof io.netty.channel.socket.ChannelInputShutdownEvent) {
+            // Target half-closed (finished sending). Relay the EOS so the SRC half-closes toward
+            // the client after drain (see SrcSessionHandler.userEventTriggered for the rationale);
+            // keep this channel open for remaining SRC->DST data unless our write side is shut too.
+            logger.debug("Target input shutdown (EOF) for ClientID: " + clientId);
+            sendEosToSrc();
+            if (outputShutdown) {
+                ctx.close();
+            }
+        } else {
+            super.userEventTriggered(ctx, evt);
+        }
     }
 
     @Override
@@ -206,21 +223,16 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (eosTimeout != null) { eosTimeout.cancel(false); eosTimeout = null; }
         if (this.clientId != null) socketController.removeTargetChannel(this.clientId);
 
-        if (this.jmsListenerId != null && !exceptionHandled && !gracefulCloseInitiatedBySrc) {
+        if (!exceptionHandled && !gracefulCloseInitiatedBySrc) {
             sendEosToSrc();
             notifySrcOfGracefulClose();
         }
-        removeJmsListener();
-    }
-
-    private void removeJmsListener() {
-        if (this.jmsListenerId != null) {
-            plugin.getAgentService().getDataPlaneService().removeMessageListener(this.jmsListenerId);
-            this.jmsListenerId = null;
-        }
+        relay.close();
     }
 
     private void sendEosToSrc() {
+        if (eosSentToSrc) return;
+        eosSentToSrc = true;
         try {
             BytesMessage eos = plugin.getAgentService().getDataPlaneService().createBytesMessage();
             eos.setJMSPriority(0);

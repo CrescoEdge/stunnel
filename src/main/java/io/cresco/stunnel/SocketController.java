@@ -48,6 +48,17 @@ public class SocketController {
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    // DST-session-init RPCs are blocking; running them on the Netty event loop froze every other
+    // client channel on that loop thread for the RPC timeout (and suppressed the health check's
+    // traffic-based proof-of-life). SrcSessionHandler runs them here instead. The semaphore bounds
+    // the parked threads a connect burst during a fabric stall can create; connects beyond the
+    // bound fail fast (they would only time out anyway).
+    private final ExecutorService dstInitExecutor = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "stunnel-dst-init");
+        t.setDaemon(true);
+        return t;
+    });
+    private final java.util.concurrent.Semaphore dstInitSlots;
 
 
     // Tunnel management (Thread-safe maps)
@@ -57,6 +68,7 @@ public class SocketController {
     private final Map<String, Channel> activeClientChannels = new ConcurrentHashMap<>(); // Map client_id -> Client Channel (src)
     private final Map<String, Channel> activeTargetChannels = new ConcurrentHashMap<>(); // Map client_id -> Target Channel (dst)
     private final Map<String, ScheduledFuture<?>> activeHealthChecks = new ConcurrentHashMap<>();
+    private final Map<String, DstSessionRelay> pendingDstRelays = new ConcurrentHashMap<>(); // client_id -> relay, until target channel active
 
     // NOTE: live tunnel status is derived from the real channel/config/health-check maps above
     // (see getTunnelStatus). The UMPLE-generated io.cresco.stunnel.state.SocketControllerSM models
@@ -87,6 +99,8 @@ public class SocketController {
         this.socketBufferBytes.set(plugin.getConfig().getIntegerParam("stunnel_socket_buffer_bytes", 4 * 1024 * 1024));
         this.readChunkBytes.set(plugin.getConfig().getIntegerParam("stunnel_read_chunk_bytes", 256 * 1024));
         this.writeHighWaterBytes.set(plugin.getConfig().getIntegerParam("stunnel_write_high_water_bytes", 2 * 1024 * 1024));
+        this.dstInitSlots = new java.util.concurrent.Semaphore(
+                plugin.getConfig().getIntegerParam("stunnel_dst_init_max_concurrent", 64));
 
         this.metricEngine = new MeasurementEngine(plugin);
         this.metricEngine.setGauge("stunnel.active.tunnels", "active SRC tunnel listeners", "stunnel", CMetric.MeasureClass.GAUGE_INT);
@@ -522,7 +536,7 @@ public class SocketController {
             logger.error("Cannot create DST session for client " + clientId + ": Tunnel config not found for stunnel_id " + stunnelId);
             return false;
         }
-        if (activeTargetChannels.containsKey(clientId)) {
+        if (activeTargetChannels.containsKey(clientId) || pendingDstRelays.containsKey(clientId)) {
             logger.warn("DST session for client " + clientId + " already exists or is connecting. Ignoring request.");
             return true;
         }
@@ -537,6 +551,18 @@ public class SocketController {
 
         logger.info("Attempting to create DST session for ClientID: " + clientId + " connecting to " + dstHost + ":" + dstPort);
 
+        // Subscribe for this session's payload BEFORE initiating the connect (and before our RPC
+        // reply releases the SRC to forward): the SRC's first bytes must never race the listener
+        // attach. The relay buffers until the target channel activates.
+        DstSessionRelay relay = new DstSessionRelay(plugin);
+        try {
+            relay.attach(stunnelId, clientId);
+        } catch (Exception e) {
+            logger.error("Cannot create DST session for client " + clientId + ": failed to attach dataplane listener.", e);
+            return false;
+        }
+        pendingDstRelays.put(clientId, relay);
+
         int sockBuf = socketBufferBytes.get();
         int readMax = readChunkBytes.get();
         int writeHigh = writeHighWaterBytes.get();
@@ -544,7 +570,7 @@ public class SocketController {
         Bootstrap b = new Bootstrap();
         b.group(workerGroup)
                 .channel(NioSocketChannel.class)
-                .handler(new DstChannelInitializer(this, plugin, tunnelConfig, clientId, pm))
+                .handler(new DstChannelInitializer(this, plugin, tunnelConfig, clientId, pm, relay))
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
@@ -559,9 +585,18 @@ public class SocketController {
         return true;
     }
 
+    /** Detach a session's relay from the pending map once its target channel is active. */
+    public void clearPendingDstRelay(String clientId) {
+        pendingDstRelays.remove(clientId);
+    }
+
     private void connectWithRetry(Bootstrap bootstrap, String host, int port, Map<String, String> tunnelConfig, String clientId, int retriesLeft) {
         if (retriesLeft <= 0) {
             logger.error("Netty Client (Dst) connection FAILED for ClientID: " + clientId + " to " + host + ":" + port + " after multiple retries.");
+            DstSessionRelay relay = pendingDstRelays.remove(clientId);
+            if (relay != null) {
+                relay.close();
+            }
             sendDstSessionFailedStatus(tunnelConfig, clientId, new ConnectException("Connection timed out after retries"));
             return;
         }
@@ -596,8 +631,23 @@ public class SocketController {
 
     private void startHealthCheck(String stunnelId, Map<String, String> tunnelConfig, Channel serverChannel) {
         AtomicInteger consecutiveFailures = new AtomicInteger(0);
-        int failureThreshold = 2;
-        long healthCheckInterval = 5; // seconds
+        int failureThreshold = plugin.getConfig().getIntegerParam("stunnel_health_failure_threshold", 3);
+        long healthCheckInterval = plugin.getConfig().getLongParam("stunnel_health_check_interval_sec", 5L);
+        // Probe budget: a probe that outlives the check interval parks the shared scheduler thread,
+        // so overdue probes fire back-to-back into a stalled fabric and a probe sent BEFORE a
+        // control-plane recovery decides the tunnel's fate AFTER it (the 2026-08-15 drop cascade).
+        // A short budget keeps probes sampling the current fabric state. The per-tunnel
+        // watchdog_timeout config key (ms) overrides the plugin-wide default.
+        long probeTimeoutMs = plugin.getConfig().getLongParam("stunnel_health_probe_timeout_ms", 10000L);
+        if (tunnelConfig.containsKey("watchdog_timeout")) {
+            try {
+                probeTimeoutMs = Long.parseLong(tunnelConfig.get("watchdog_timeout"));
+            } catch (NumberFormatException e) {
+                logger.warn("Invalid watchdog_timeout '" + tunnelConfig.get("watchdog_timeout")
+                        + "' for tunnel " + stunnelId + ", using default: " + probeTimeoutMs);
+            }
+        }
+        final long probeTimeout = probeTimeoutMs;
 
         Runnable healthCheckTask = () -> {
             try {
@@ -628,11 +678,7 @@ public class SocketController {
 
                 // If the tunnel is idle, proceed with the active network probe.
                 logger.debug("Tunnel " + stunnelId + " is idle. Performing active health check.");
-                MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
-                request.setParam("action", "tunnelhealthcheck");
-                request.setParam("action_stunnel_id", stunnelId);
-
-                MsgEvent response = plugin.sendRPC(request);
+                MsgEvent response = sendTunnelHealthProbe(stunnelId, tunnelConfig, probeTimeout);
 
                 if (response != null && "10".equals(response.getParam("status"))) {
                     consecutiveFailures.set(0);
@@ -641,9 +687,28 @@ public class SocketController {
                     int failures = consecutiveFailures.incrementAndGet();
                     logger.warn("Health check failed for tunnel: " + stunnelId + ". Consecutive failures: " + failures);
                     if (failures >= failureThreshold) {
-                        logger.error("Health check failure threshold reached for tunnel: " + stunnelId + ". Forcing tunnel closure and rebuild.");
-                        serverChannel.close(); // This will trigger the closeFuture listener to rebuild the tunnel
-                        stopHealthCheck(stunnelId);
+                        // A probe interrupted by cancel(true) surfaces as a null response (the RPC
+                        // layer swallows the interrupt), so re-check liveness before spending
+                        // another probe budget or closing on behalf of a cancelled check.
+                        if (scheduler.isShutdown() || !serverChannel.isOpen() || !activeHealthChecks.containsKey(stunnelId)) {
+                            logger.info("Health check for tunnel " + stunnelId + " cancelled at threshold; skipping closure.");
+                            return;
+                        }
+                        // Teardown kills every live client session on the tunnel, so require one
+                        // fresh probe to fail too: the counted failures may all be probes that were
+                        // sent into a stall that has since cleared.
+                        logger.warn("Health check failure threshold reached for tunnel: " + stunnelId + ". Sending verification probe before closure.");
+                        MsgEvent verify = sendTunnelHealthProbe(stunnelId, tunnelConfig, probeTimeout);
+                        if (verify != null && "10".equals(verify.getParam("status"))) {
+                            consecutiveFailures.set(0);
+                            logger.info("Verification probe succeeded for tunnel: " + stunnelId + ". Cancelling closure.");
+                        } else if (!activeHealthChecks.containsKey(stunnelId)) {
+                            logger.info("Health check for tunnel " + stunnelId + " cancelled during verification; skipping closure.");
+                        } else {
+                            logger.error("Health check failure threshold reached for tunnel: " + stunnelId + ". Forcing tunnel closure and rebuild.");
+                            serverChannel.close(); // This will trigger the closeFuture listener to rebuild the tunnel
+                            stopHealthCheck(stunnelId);
+                        }
                     }
                 }
             } catch (Exception e) {
@@ -657,9 +722,19 @@ public class SocketController {
             }
         };
 
-        ScheduledFuture<?> healthCheckFuture = scheduler.scheduleAtFixedRate(healthCheckTask, healthCheckInterval, healthCheckInterval, TimeUnit.SECONDS);
+        // Fixed DELAY, not fixed rate: a slow probe must not queue an overdue probe that then fires
+        // back-to-back — each cycle should observe the fabric as it is now.
+        ScheduledFuture<?> healthCheckFuture = scheduler.scheduleWithFixedDelay(healthCheckTask, healthCheckInterval, healthCheckInterval, TimeUnit.SECONDS);
         activeHealthChecks.put(stunnelId, healthCheckFuture);
-        logger.info("Health check scheduled for tunnel " + stunnelId + " every " + healthCheckInterval + " seconds.");
+        logger.info("Health check scheduled for tunnel " + stunnelId + " every " + healthCheckInterval
+                + " seconds (probe timeout " + probeTimeout + " ms, failure threshold " + failureThreshold + ").");
+    }
+
+    private MsgEvent sendTunnelHealthProbe(String stunnelId, Map<String, String> tunnelConfig, long timeoutMs) {
+        MsgEvent request = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, tunnelConfig.get("dst_region"), tunnelConfig.get("dst_agent"), tunnelConfig.get("dst_plugin"));
+        request.setParam("action", "tunnelhealthcheck");
+        request.setParam("action_stunnel_id", stunnelId);
+        return plugin.sendRPC(request, timeoutMs);
     }
 
     private void stopHealthCheck(String stunnelId) {
@@ -840,6 +915,7 @@ public class SocketController {
         logger.info("Shutting down SocketController and all Netty components...");
         // Gracefully shutdown the scheduler to stop new reconnection tasks
         scheduler.shutdown();
+        dstInitExecutor.shutdownNow();
 
         // Close all active server channels, which will trigger their cleanup listeners
         activeServerChannels.values().forEach(Channel::close);
@@ -876,6 +952,8 @@ public class SocketController {
         activeTargetChannels.clear();
         activeTunnelsConfig.clear();
         performanceMonitors.clear();
+        pendingDstRelays.values().forEach(DstSessionRelay::close);
+        pendingDstRelays.clear();
 
         logger.info("SocketController shutdown complete.");
     }
@@ -917,6 +995,25 @@ public class SocketController {
     public Map<String, String> getTunnelConfig(String stunnelId) {
         Map<String, String> config = activeTunnelsConfig.get(stunnelId);
         return (config != null) ? Collections.unmodifiableMap(config) : null;
+    }
+
+    /** Executor for blocking DST-session-init RPCs, keeping them off the Netty event loops. */
+    public ExecutorService getDstInitExecutor() {
+        return dstInitExecutor;
+    }
+
+    /** Bound on concurrent DST-init RPCs; false = at capacity, caller should fail the connect fast. */
+    public boolean tryAcquireDstInitSlot() {
+        return dstInitSlots.tryAcquire();
+    }
+
+    public void releaseDstInitSlot() {
+        dstInitSlots.release();
+    }
+
+    /** RPC budget for the per-client configdstsession call (SRC connect -> DST target connect). */
+    public long getDstInitTimeoutMs() {
+        return plugin.getConfig().getLongParam("stunnel_dst_init_timeout_ms", 10000L);
     }
 
     /**
