@@ -29,10 +29,16 @@ public class DstSessionRelay {
     private MessageListener target;   // guarded by lock; null until the session handler activates
     private String jmsListenerId;     // guarded by lock; null after close
     private boolean closed;           // guarded by lock
+    private boolean overflowed;       // guarded by lock; buffer cap exceeded before activation
+    private final int maxBuffered;
 
     public DstSessionRelay(PluginBuilder plugin) {
         this.plugin = plugin;
         this.logger = plugin.getLogger(getClass().getName(), CLogger.Level.Info);
+        // Cap the pre-activation buffer. Payload messages are up to stunnel_read_chunk_bytes
+        // (256KB default) each, so an unbounded buffer is an OOM waiting for a slow target
+        // connect while the SRC floods: 1000 buffered messages would be ~256MB per session.
+        this.maxBuffered = plugin.getConfig().getIntegerParam("stunnel_dst_relay_buffer_max", 256);
     }
 
     /** Subscribe for this session's payload. Call before initiating the target connect. */
@@ -43,6 +49,17 @@ public class DstSessionRelay {
                     return;
                 }
                 if (target == null) {
+                    if (buffered.size() >= maxBuffered) {
+                        // Fail the session rather than grow without bound; activate() reports this
+                        // so the handler closes the target channel and the SRC is told.
+                        if (!overflowed) {
+                            overflowed = true;
+                            buffered.clear();
+                            logger.error("DST relay buffer exceeded " + maxBuffered
+                                    + " messages before target activation - failing session");
+                        }
+                        return;
+                    }
                     buffered.add(msg);
                 } else {
                     target.onMessage(msg);
@@ -74,17 +91,21 @@ public class DstSessionRelay {
         }
     }
 
-    /** Drain buffered messages into the real listener and hand it all future deliveries. */
-    public void activate(MessageListener listener) {
+    /**
+     * Drain buffered messages into the real listener and hand it all future deliveries.
+     * @return false when the relay is closed or overflowed — the caller must fail the session.
+     */
+    public boolean activate(MessageListener listener) {
         synchronized (lock) {
-            if (closed) {
-                return;
+            if (closed || overflowed) {
+                return false;
             }
             for (Message m : buffered) {
                 listener.onMessage(m);
             }
             buffered.clear();
             target = listener;
+            return true;
         }
     }
 

@@ -89,7 +89,13 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 ctx.channel().eventLoop().execute(() -> processJmsMessage(ctx, msg));
             }
         };
-        relay.activate(ml);
+        if (!relay.activate(ml)) {
+            // relay closed or its pre-activation buffer overflowed: this session can no longer be
+            // delivered in order, so fail it loudly instead of serving a silently truncated stream
+            logger.error("DST relay unusable for ClientID: " + clientId + " - closing target channel");
+            notifySrcOfError(new Exception("DST relay buffer overflow or closed before activation"));
+            ctx.close();
+        }
     }
 
     private void processJmsMessage(ChannelHandlerContext ctx, Message msg) {
