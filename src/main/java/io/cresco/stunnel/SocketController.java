@@ -555,12 +555,31 @@ public class SocketController {
         // reply releases the SRC to forward): the SRC's first bytes must never race the listener
         // attach. The relay buffers until the target channel activates.
         DstSessionRelay relay = new DstSessionRelay(plugin);
+        // BOUNDED ATTACH. The listener attach reaches into the broker (createConsumer on a
+        // failover transport, behind an unbounded wait in DataPlaneServiceImpl.getSession), so a
+        // wedged dataplane connection blocks it INDEFINITELY. Doing that inline parked the inbound
+        // MsgEvent thread forever: one leaked pool thread per session, no error, and the tunnel
+        // session never even reached the connect below - a silent, permanent outage. Fail fast and
+        // loudly instead, so the SRC gets a status 9, logs, closes, and the client can retry.
+        long attachTimeoutMs = plugin.getConfig().getLongParam("stunnel_dst_attach_timeout_ms", 10000L);
+        Future<?> attachFuture = dstInitExecutor.submit(() -> {
+            try {
+                relay.attach(stunnelId, clientId);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
         try {
-            relay.attach(stunnelId, clientId);
+            attachFuture.get(attachTimeoutMs, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
-            logger.error("Cannot create DST session for client " + clientId + ": failed to attach dataplane listener.", e);
+            attachFuture.cancel(true);
+            relay.close();
+            logger.error("Cannot create DST session for client " + clientId
+                    + ": dataplane listener attach did not complete within " + attachTimeoutMs
+                    + "ms (dataplane broker connection may be wedged) - " + e);
             return false;
         }
+        logger.debug("DST session dataplane listener attached for ClientID: " + clientId);
         pendingDstRelays.put(clientId, relay);
 
         int sockBuf = socketBufferBytes.get();

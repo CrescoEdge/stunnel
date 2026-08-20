@@ -50,8 +50,27 @@ public class DstSessionRelay {
             }
         };
         String queryString = String.format("stunnel_id='%s' AND client_id='%s' AND direction='dst'", stunnelId, clientId);
+        // NEVER hold `lock` across this call. addMessageListener -> ActiveMQMessageConsumer
+        // .setMessageListener internally calls ActiveMQSession.stop(), which stops EVERY consumer
+        // on the shared dataplane session and needs each one's dispatch mutex. A dispatch thread
+        // delivering to a relay holds that mutex while its listener takes `lock` — so holding
+        // `lock` here inverted the order and deadlocked both threads permanently (and, because
+        // session.stop() touches all consumers, froze every later attach too).
+        String id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL, ml, queryString);
+        boolean abandoned = false;
         synchronized (lock) {
-            this.jmsListenerId = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL, ml, queryString);
+            if (closed) {
+                abandoned = true;      // close() raced us; do not publish the id
+            } else {
+                this.jmsListenerId = id;
+            }
+        }
+        if (abandoned && id != null) {
+            try {
+                plugin.getAgentService().getDataPlaneService().removeMessageListener(id);
+            } catch (Exception ex) {
+                logger.warn("Failed to remove listener for closed relay: " + ex.getMessage());
+            }
         }
     }
 
@@ -71,17 +90,22 @@ public class DstSessionRelay {
 
     /** Remove the subscription. Idempotent. */
     public void close() {
+        String id;
         synchronized (lock) {
             closed = true;
             buffered.clear();
             target = null;
-            if (jmsListenerId != null) {
-                try {
-                    plugin.getAgentService().getDataPlaneService().removeMessageListener(jmsListenerId);
-                } catch (Exception e) {
-                    logger.warn("Failed to remove DST session listener: " + e.getMessage());
-                }
-                jmsListenerId = null;
+            id = jmsListenerId;
+            jmsListenerId = null;
+        }
+        // Outside the lock, for the same reason as attach(): removeMessageListener closes the JMS
+        // consumer and takes ActiveMQ's session/dispatch locks, which a dispatch thread can hold
+        // while waiting on `lock` inside our listener.
+        if (id != null) {
+            try {
+                plugin.getAgentService().getDataPlaneService().removeMessageListener(id);
+            } catch (Exception e) {
+                logger.warn("Failed to remove DST session listener: " + e.getMessage());
             }
         }
     }
