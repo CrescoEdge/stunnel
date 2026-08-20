@@ -24,15 +24,15 @@ public class DstChannelInitializer extends ChannelInitializer<SocketChannel> {
     private final Map<String, String> tunnelConfig;
     private final String clientId;
     private final PerformanceMonitor performanceMonitor;
-    private final DstSessionRelay relay;
+    private final TunnelDemux demux;
 
-    public DstChannelInitializer(SocketController sc, PluginBuilder pb, Map<String, String> tc, String clientId, PerformanceMonitor pm, DstSessionRelay relay) {
+    public DstChannelInitializer(SocketController sc, PluginBuilder pb, Map<String, String> tc, String clientId, PerformanceMonitor pm, TunnelDemux demux) {
         this.socketController = sc;
         this.plugin = pb;
         this.tunnelConfig = tc;
         this.clientId = clientId;
         this.performanceMonitor = pm;
-        this.relay = relay;
+        this.demux = demux;
     }
 
     @Override
@@ -42,7 +42,7 @@ public class DstChannelInitializer extends ChannelInitializer<SocketChannel> {
         ch.config().setAllowHalfClosure(true);
         ch.attr(SrcChannelInitializer.CLIENT_ID_KEY).set(clientId);
         ch.attr(SrcChannelInitializer.STUNNEL_ID_KEY).set(stunnelId);
-        p.addLast(new DstSessionHandler(socketController, plugin, performanceMonitor, relay));
+        p.addLast(new DstSessionHandler(socketController, plugin, performanceMonitor, demux));
     }
 }
 
@@ -51,7 +51,7 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private final SocketController socketController;
     private final PluginBuilder plugin;
     private final PerformanceMonitor performanceMonitor;
-    private final DstSessionRelay relay;
+    private final TunnelDemux demux;
     private final CLogger logger;
     private String clientId;
     private String stunnelId;
@@ -65,11 +65,11 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private static final long EOS_TIMEOUT_MS = 5000;
     private ScheduledFuture<?> eosTimeout;
 
-    public DstSessionHandler(SocketController sc, PluginBuilder pb, PerformanceMonitor pm, DstSessionRelay relay) {
+    public DstSessionHandler(SocketController sc, PluginBuilder pb, PerformanceMonitor pm, TunnelDemux demux) {
         this.socketController = sc;
         this.plugin = pb;
         this.performanceMonitor = pm;
-        this.relay = relay;
+        this.demux = demux;
         this.logger = plugin.getLogger(getClass().getName(), CLogger.Level.Info);
     }
 
@@ -78,10 +78,10 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
         this.clientId = ctx.channel().attr(SrcChannelInitializer.CLIENT_ID_KEY).get();
         this.stunnelId = ctx.channel().attr(SrcChannelInitializer.STUNNEL_ID_KEY).get();
         socketController.addTargetChannel(clientId, ctx.channel());
-        socketController.clearPendingDstRelay(clientId);
         logger.info("DST Channel Active (to target): " + ctx.channel().remoteAddress() + ", ClientID: " + clientId + ", StunnelID: " + stunnelId);
-        // The relay was subscribed before the connect was initiated (so the SRC's first bytes
-        // could not race the listener attach); drain anything it buffered and go live.
+        // The tunnel's demux was subscribed at tunnel setup and has been buffering this client
+        // since createDstSession (so the SRC's first bytes cannot be lost); drain and go live.
+        // This is a map insert — no JMS call on the session path at all.
         MessageListener ml = msg -> {
             if (ctx.channel().eventLoop().inEventLoop()) {
                 processJmsMessage(ctx, msg);
@@ -89,11 +89,11 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 ctx.channel().eventLoop().execute(() -> processJmsMessage(ctx, msg));
             }
         };
-        if (!relay.activate(ml)) {
-            // relay closed or its pre-activation buffer overflowed: this session can no longer be
-            // delivered in order, so fail it loudly instead of serving a silently truncated stream
-            logger.error("DST relay unusable for ClientID: " + clientId + " - closing target channel");
-            notifySrcOfError(new Exception("DST relay buffer overflow or closed before activation"));
+        if (!demux.register(clientId, ml)) {
+            // buffer overflowed before the target connected, or the tunnel went away: this stream
+            // can no longer be delivered intact, so fail loudly instead of serving a truncated one
+            logger.error("DST demux unusable for ClientID: " + clientId + " - closing target channel");
+            notifySrcOfError(new Exception("DST demux buffer overflow or tunnel closed before activation"));
             ctx.close();
         }
     }
@@ -233,7 +233,7 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             sendEosToSrc();
             notifySrcOfGracefulClose();
         }
-        relay.close();
+        demux.discard(clientId);
     }
 
     private void sendEosToSrc() {

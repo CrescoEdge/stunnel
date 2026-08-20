@@ -57,7 +57,7 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private final CLogger logger;
     private String clientId;
     private String stunnelId;
-    private String jmsListenerId;
+    private TunnelDemux demux;
 
     private volatile boolean gracefulCloseInitiatedByDst = false;
     private volatile boolean eosSeen = false;
@@ -112,10 +112,11 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
         // open, autoRead(false), no listener, never closed (exceptionCaught only covers pipeline
         // threads). Fail closed instead.
         try {
-            // Attach our return-path listener BEFORE the RPC: the DST only starts publishing
+            // Register our return-path handler BEFORE the RPC: the DST only starts publishing
             // direction='src' traffic (e.g. a server-speaks-first banner) after it receives this
-            // request, so subscribing first guarantees nothing from the target can be dropped.
-            if (!setupJmsListener(ctx)) {
+            // request, so registering first guarantees nothing from the target can be dropped.
+            // The tunnel's consumer already exists — this is a map insert, not a JMS call.
+            if (!setupDemuxHandler(ctx)) {
                 ctx.close();
                 return;
             }
@@ -162,8 +163,13 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
     }
 
-    private boolean setupJmsListener(ChannelHandlerContext ctx) {
+    private boolean setupDemuxHandler(ChannelHandlerContext ctx) {
         try {
+            demux = socketController.getSrcDemux(stunnelId);
+            if (demux == null) {
+                logger.error("No SRC demux for StunnelID: " + stunnelId + " (ClientID: " + clientId + ")");
+                return false;
+            }
             MessageListener ml = msg -> {
                 if (ctx.channel().eventLoop().inEventLoop()) {
                     processJmsMessage(ctx, msg);
@@ -171,11 +177,14 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     ctx.channel().eventLoop().execute(() -> processJmsMessage(ctx, msg));
                 }
             };
-            String queryString = String.format("stunnel_id='%s' AND client_id='%s' AND direction='src'", this.stunnelId, this.clientId);
-            this.jmsListenerId = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL, ml, queryString);
+            demux.expect(clientId);
+            if (!demux.register(clientId, ml)) {
+                logger.error("SRC demux unusable for ClientID: " + clientId);
+                return false;
+            }
             return true;
         } catch (Exception e) {
-            logger.error("Failed to setup JMS listener for ClientID: " + clientId + ". Closing connection.", e);
+            logger.error("Failed to register SRC demux handler for ClientID: " + clientId, e);
             return false;
         }
     }
@@ -318,16 +327,18 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (eosTimeout != null) { eosTimeout.cancel(false); eosTimeout = null; }
         if (this.clientId != null) socketController.removeClientChannel(this.clientId);
 
-        // Notify the DST side even when no JMS listener was ever set up (init RPC failed or still
-        // in flight): the configdstsession CONFIG is persistent and can be delivered late, so the
-        // DST may open (or hold) a target connection for this already-dead client otherwise.
+        // Notify the DST side even when the session never completed setup (init RPC failed or was
+        // still in flight): the configdstsession CONFIG is persistent and can be delivered late, so
+        // the DST may open (or hold) a target connection for this already-dead client otherwise.
         // EOS first (mirrors the DST's close path): without it the DST sat in its 5s EOS timeout
         // and tore the session down as an error on every client-initiated close.
         if (!gracefulCloseInitiatedByDst && this.clientId != null && this.stunnelId != null) {
             sendEosToDst();
             notifyDstOfClose();
         }
-        removeJmsListener();
+        if (demux != null && clientId != null) {
+            demux.discard(clientId);
+        }
     }
 
     private void sendEosToDst() {
@@ -344,13 +355,6 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             logger.debug("EOS sent to DST for ClientID: " + clientId);
         } catch (Exception e) {
             logger.error("Failed to send EOS to DST for ClientID: " + clientId, e);
-        }
-    }
-
-    private void removeJmsListener() {
-        if (this.jmsListenerId != null) {
-            plugin.getAgentService().getDataPlaneService().removeMessageListener(this.jmsListenerId);
-            this.jmsListenerId = null;
         }
     }
 

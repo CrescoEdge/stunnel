@@ -68,7 +68,11 @@ public class SocketController {
     private final Map<String, Channel> activeClientChannels = new ConcurrentHashMap<>(); // Map client_id -> Client Channel (src)
     private final Map<String, Channel> activeTargetChannels = new ConcurrentHashMap<>(); // Map client_id -> Target Channel (dst)
     private final Map<String, ScheduledFuture<?>> activeHealthChecks = new ConcurrentHashMap<>();
-    private final Map<String, DstSessionRelay> pendingDstRelays = new ConcurrentHashMap<>(); // client_id -> relay, until target channel active
+    // ONE dataplane consumer per tunnel per direction (see TunnelDemux). Sessions register into
+    // these by client_id — no per-session JMS consumer, so no ActiveMQSession.stop() storm and no
+    // lock-across-JMS surface.
+    private final Map<String, TunnelDemux> srcDemux = new ConcurrentHashMap<>(); // stunnel_id -> src demux
+    private final Map<String, TunnelDemux> dstDemux = new ConcurrentHashMap<>(); // stunnel_id -> dst demux
 
     // NOTE: live tunnel status is derived from the real channel/config/health-check maps above
     // (see getTunnelStatus). The UMPLE-generated io.cresco.stunnel.state.SocketControllerSM models
@@ -428,6 +432,17 @@ public class SocketController {
                 throw new IOException("Server channel is not active after binding to port " + srcPort);
             }
 
+            TunnelDemux sDemux = new TunnelDemux(plugin, stunnelId, "src");
+            try {
+                sDemux.open();
+            } catch (Exception e) {
+                logger.error("Failed to open SRC demux for tunnel " + stunnelId, e);
+                serverChannel.close();
+                throw e;
+            }
+            TunnelDemux oldSrc = srcDemux.put(stunnelId, sDemux);
+            if (oldSrc != null) oldSrc.close();
+
             activeServerChannels.put(stunnelId, serverChannel);
             activeTunnelsConfig.put(stunnelId, tunnelConfig);
 
@@ -526,6 +541,18 @@ public class SocketController {
             return null;
         }
 
+        // One consumer for the whole tunnel, opened once here instead of once per client session.
+        TunnelDemux demux = new TunnelDemux(plugin, stunnelId, "dst");
+        try {
+            demux.open();
+        } catch (Exception e) {
+            logger.error("Failed to open DST demux for tunnel " + stunnelId, e);
+            performanceMonitors.remove(stunnelId + "_dst");
+            activeTunnelsConfig.remove(stunnelId);
+            return null;
+        }
+        dstDemux.put(stunnelId, demux);
+
         logger.info("DST tunnel configured successfully for ID: " + stunnelId);
         return tunnelConfig;
     }
@@ -536,7 +563,7 @@ public class SocketController {
             logger.error("Cannot create DST session for client " + clientId + ": Tunnel config not found for stunnel_id " + stunnelId);
             return false;
         }
-        if (activeTargetChannels.containsKey(clientId) || pendingDstRelays.containsKey(clientId)) {
+        if (activeTargetChannels.containsKey(clientId)) {
             logger.warn("DST session for client " + clientId + " already exists or is connecting. Ignoring request.");
             return true;
         }
@@ -554,33 +581,15 @@ public class SocketController {
         // Subscribe for this session's payload BEFORE initiating the connect (and before our RPC
         // reply releases the SRC to forward): the SRC's first bytes must never race the listener
         // attach. The relay buffers until the target channel activates.
-        DstSessionRelay relay = new DstSessionRelay(plugin);
-        // BOUNDED ATTACH. The listener attach reaches into the broker (createConsumer on a
-        // failover transport, behind an unbounded wait in DataPlaneServiceImpl.getSession), so a
-        // wedged dataplane connection blocks it INDEFINITELY. Doing that inline parked the inbound
-        // MsgEvent thread forever: one leaked pool thread per session, no error, and the tunnel
-        // session never even reached the connect below - a silent, permanent outage. Fail fast and
-        // loudly instead, so the SRC gets a status 9, logs, closes, and the client can retry.
-        long attachTimeoutMs = plugin.getConfig().getLongParam("stunnel_dst_attach_timeout_ms", 10000L);
-        Future<?> attachFuture = dstInitExecutor.submit(() -> {
-            try {
-                relay.attach(stunnelId, clientId);
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        });
-        try {
-            attachFuture.get(attachTimeoutMs, TimeUnit.MILLISECONDS);
-        } catch (Exception e) {
-            attachFuture.cancel(true);
-            relay.close();
-            logger.error("Cannot create DST session for client " + clientId
-                    + ": dataplane listener attach did not complete within " + attachTimeoutMs
-                    + "ms (dataplane broker connection may be wedged) - " + e);
+        TunnelDemux demux = dstDemux.get(stunnelId);
+        if (demux == null) {
+            logger.error("Cannot create DST session for client " + clientId + ": no demux for stunnel_id " + stunnelId);
             return false;
         }
-        logger.debug("DST session dataplane listener attached for ClientID: " + clientId);
-        pendingDstRelays.put(clientId, relay);
+        // Buffer this client's payload until its target channel activates (the first-bytes race).
+        // This is a map insert — no JMS call, so it cannot block, stall the shared dataplane
+        // session, or deadlock the way the old per-session listener attach did.
+        demux.expect(clientId);
 
         int sockBuf = socketBufferBytes.get();
         int readMax = readChunkBytes.get();
@@ -589,7 +598,7 @@ public class SocketController {
         Bootstrap b = new Bootstrap();
         b.group(workerGroup)
                 .channel(NioSocketChannel.class)
-                .handler(new DstChannelInitializer(this, plugin, tunnelConfig, clientId, pm, relay))
+                .handler(new DstChannelInitializer(this, plugin, tunnelConfig, clientId, pm, demux))
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
@@ -604,17 +613,22 @@ public class SocketController {
         return true;
     }
 
-    /** Detach a session's relay from the pending map once its target channel is active. */
-    public void clearPendingDstRelay(String clientId) {
-        pendingDstRelays.remove(clientId);
+    /** The tunnel's DST demux, or null when the tunnel is not configured here. */
+    public TunnelDemux getDstDemux(String stunnelId) {
+        return dstDemux.get(stunnelId);
+    }
+
+    /** The tunnel's SRC demux, or null when this node does not host the listener. */
+    public TunnelDemux getSrcDemux(String stunnelId) {
+        return srcDemux.get(stunnelId);
     }
 
     private void connectWithRetry(Bootstrap bootstrap, String host, int port, Map<String, String> tunnelConfig, String clientId, int retriesLeft) {
         if (retriesLeft <= 0) {
             logger.error("Netty Client (Dst) connection FAILED for ClientID: " + clientId + " to " + host + ":" + port + " after multiple retries.");
-            DstSessionRelay relay = pendingDstRelays.remove(clientId);
-            if (relay != null) {
-                relay.close();
+            TunnelDemux d = dstDemux.get(tunnelConfig.get("stunnel_id"));
+            if (d != null) {
+                d.discard(clientId);
             }
             sendDstSessionFailedStatus(tunnelConfig, clientId, new ConnectException("Connection timed out after retries"));
             return;
@@ -888,6 +902,9 @@ public class SocketController {
             });
         }
 
+        TunnelDemux sd = srcDemux.remove(stunnelId);
+        if (sd != null) sd.close();
+
         activeTunnelsConfig.remove(stunnelId);
         PerformanceMonitor pm = performanceMonitors.remove(stunnelId + "_src");
         if (pm != null) {
@@ -920,6 +937,9 @@ public class SocketController {
                 }
             });
         }
+
+        TunnelDemux dd = dstDemux.remove(stunnelId);
+        if (dd != null) dd.close();
 
         activeTunnelsConfig.remove(stunnelId);
         PerformanceMonitor pm = performanceMonitors.remove(stunnelId + "_dst");
@@ -971,8 +991,10 @@ public class SocketController {
         activeTargetChannels.clear();
         activeTunnelsConfig.clear();
         performanceMonitors.clear();
-        pendingDstRelays.values().forEach(DstSessionRelay::close);
-        pendingDstRelays.clear();
+        srcDemux.values().forEach(TunnelDemux::close);
+        srcDemux.clear();
+        dstDemux.values().forEach(TunnelDemux::close);
+        dstDemux.clear();
 
         logger.info("SocketController shutdown complete.");
     }
