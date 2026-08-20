@@ -433,12 +433,9 @@ public class SocketController {
             }
 
             TunnelDemux sDemux = new TunnelDemux(plugin, stunnelId, "src");
-            try {
-                sDemux.open();
-            } catch (Exception e) {
-                logger.error("Failed to open SRC demux for tunnel " + stunnelId, e);
+            if (!openDemuxBounded(sDemux, stunnelId, "src")) {
                 serverChannel.close();
-                throw e;
+                throw new IOException("SRC demux open failed for tunnel " + stunnelId);
             }
             TunnelDemux oldSrc = srcDemux.put(stunnelId, sDemux);
             if (oldSrc != null) oldSrc.close();
@@ -543,10 +540,7 @@ public class SocketController {
 
         // One consumer for the whole tunnel, opened once here instead of once per client session.
         TunnelDemux demux = new TunnelDemux(plugin, stunnelId, "dst");
-        try {
-            demux.open();
-        } catch (Exception e) {
-            logger.error("Failed to open DST demux for tunnel " + stunnelId, e);
+        if (!openDemuxBounded(demux, stunnelId, "dst")) {
             performanceMonitors.remove(stunnelId + "_dst");
             activeTunnelsConfig.remove(stunnelId);
             return null;
@@ -555,6 +549,34 @@ public class SocketController {
 
         logger.info("DST tunnel configured successfully for ID: " + stunnelId);
         return tunnelConfig;
+    }
+
+    /**
+     * Open a tunnel demux with a bounded wait. demux.open() makes the tunnel's single JMS call, and
+     * it runs on the plugin message thread (configdsttunnel, retried by ReconnectTask every 10s) —
+     * an unbounded block there would park a message thread per attempt, the same failure shape as
+     * the per-session attach. Fail the tunnel instead; the caller reports it and the retry loop
+     * tries again later.
+     */
+    private boolean openDemuxBounded(TunnelDemux demux, String stunnelId, String direction) {
+        long timeoutMs = plugin.getConfig().getLongParam("stunnel_demux_open_timeout_ms", 15000L);
+        Future<?> f = dstInitExecutor.submit(() -> {
+            try {
+                demux.open();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+        try {
+            f.get(timeoutMs, TimeUnit.MILLISECONDS);
+            return true;
+        } catch (Exception e) {
+            f.cancel(true);
+            demux.close();
+            logger.error("Failed to open " + direction + " demux for tunnel " + stunnelId
+                    + " within " + timeoutMs + "ms (dataplane may be unavailable) - " + e);
+            return false;
+        }
     }
 
     public boolean createDstSession(String stunnelId, String clientId) {
