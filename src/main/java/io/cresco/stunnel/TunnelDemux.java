@@ -39,6 +39,7 @@ public class TunnelDemux {
     private final Map<String, MessageListener> handlers = new ConcurrentHashMap<>();
     private final Map<String, List<Message>> pending = new ConcurrentHashMap<>();
     private final Map<String, Boolean> overflowed = new ConcurrentHashMap<>();
+    private final java.util.Set<String> draining = new java.util.HashSet<>();   // guarded by lock
     private final Object lock = new Object();   // guards the buffer/handler handoff ONLY
 
     private volatile String jmsListenerId;
@@ -80,7 +81,10 @@ public class TunnelDemux {
         MessageListener handler;
         synchronized (lock) {
             handler = handlers.get(clientId);
-            if (handler == null) {
+            // While a drain is in progress the handler is registered but the buffered backlog has
+            // not been delivered yet, so live messages MUST keep queueing behind it or the stream
+            // reorders — the exact corruption the pre-registration buffer exists to prevent.
+            if (handler == null || draining.contains(clientId)) {
                 List<Message> buf = pending.get(clientId);
                 if (buf == null) {
                     // never announced (or already finished): stray/late delivery, drop it
@@ -117,20 +121,40 @@ public class TunnelDemux {
      * @return false if the client overflowed its buffer or the demux is closed — fail the session.
      */
     public boolean register(String clientId, MessageListener handler) {
-        List<Message> drain;
         synchronized (lock) {
             if (closed || overflowed.containsKey(clientId)) {
                 return false;
             }
-            drain = pending.remove(clientId);
+            pending.putIfAbsent(clientId, new ArrayList<>());
             handlers.put(clientId, handler);
+            draining.add(clientId);   // dispatch keeps buffering until the backlog is delivered
         }
-        if (drain != null) {
-            for (Message m : drain) {
-                handler.onMessage(m);
+        // Drain in passes: anything that arrives mid-drain lands in the buffer (dispatch sees
+        // draining=true) and is picked up by the next pass, so per-client order is exact. Delivery
+        // happens OUTSIDE the lock, so no lock is ever held across handler work.
+        try {
+            while (true) {
+                List<Message> batch;
+                synchronized (lock) {
+                    List<Message> buf = pending.get(clientId);
+                    if (buf == null || buf.isEmpty()) {
+                        pending.remove(clientId);
+                        draining.remove(clientId);
+                        return true;
+                    }
+                    batch = new ArrayList<>(buf);
+                    buf.clear();
+                }
+                for (Message m : batch) {
+                    handler.onMessage(m);
+                }
             }
+        } catch (RuntimeException ex) {
+            synchronized (lock) {
+                draining.remove(clientId);
+            }
+            throw ex;
         }
-        return true;
     }
 
     /** Drop a client: its handler, any buffer, and its overflow flag. No JMS involved. */
@@ -139,6 +163,7 @@ public class TunnelDemux {
             handlers.remove(clientId);
             pending.remove(clientId);
             overflowed.remove(clientId);
+            draining.remove(clientId);
         }
     }
 
@@ -155,6 +180,7 @@ public class TunnelDemux {
             handlers.clear();
             pending.clear();
             overflowed.clear();
+            draining.clear();
             id = jmsListenerId;
             jmsListenerId = null;
         }
