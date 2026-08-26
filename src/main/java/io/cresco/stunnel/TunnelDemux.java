@@ -63,7 +63,25 @@ public class TunnelDemux {
         if (id == null) {
             throw new IllegalStateException("null listener id for tunnel " + stunnelId + " (" + direction + ")");
         }
-        jmsListenerId = id;
+        boolean lateOpen;
+        synchronized (lock) {
+            if (closed) {
+                // close() already ran (the bounded open timed out and gave up on us): nothing will
+                // ever remove the consumer we just created, so remove it here or it leaks
+                lateOpen = true;
+            } else {
+                jmsListenerId = id;
+                lateOpen = false;
+            }
+        }
+        if (lateOpen) {
+            try {
+                plugin.getAgentService().getDataPlaneService().removeMessageListener(id);
+            } catch (Exception ex) {
+                logger.warn("demux late-open consumer removal failed for " + stunnelId + ": " + ex.getMessage());
+            }
+            throw new IllegalStateException("demux closed during open for tunnel " + stunnelId + " (" + direction + ")");
+        }
         logger.info("Tunnel demux open: stunnel_id=" + stunnelId + " direction=" + direction);
     }
 

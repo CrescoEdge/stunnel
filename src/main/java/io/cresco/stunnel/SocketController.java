@@ -47,7 +47,9 @@ public class SocketController {
     // Netty specific components
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    // sized in the constructor: ONE thread here serialized every tunnel's health probe,
+    // reconnect, and beacon behind each other, so one blocking probe to a slow peer stalled all
+    private final ScheduledExecutorService scheduler;
     // DST-session-init RPCs are blocking; running them on the Netty event loop froze every other
     // client channel on that loop thread for the RPC timeout (and suppressed the health check's
     // traffic-based proof-of-life). SrcSessionHandler runs them here instead. The semaphore bounds
@@ -105,6 +107,12 @@ public class SocketController {
         this.writeHighWaterBytes.set(plugin.getConfig().getIntegerParam("stunnel_write_high_water_bytes", 2 * 1024 * 1024));
         this.dstInitSlots = new java.util.concurrent.Semaphore(
                 plugin.getConfig().getIntegerParam("stunnel_dst_init_max_concurrent", 64));
+        this.scheduler = Executors.newScheduledThreadPool(
+                plugin.getConfig().getIntegerParam("stunnel_scheduler_threads", 4), r -> {
+                    Thread t = new Thread(r, "stunnel-scheduler");
+                    t.setDaemon(true);
+                    return t;
+                });
 
         this.metricEngine = new MeasurementEngine(plugin);
         this.metricEngine.setGauge("stunnel.active.tunnels", "active SRC tunnel listeners", "stunnel", CMetric.MeasureClass.GAUGE_INT);
