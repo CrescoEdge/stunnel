@@ -65,6 +65,14 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private static final long EOS_TIMEOUT_MS = 5000;
     private ScheduledFuture<?> eosTimeout;
 
+    // src->dst flow control: bytes delivered to the target socket since the last ack; an ack
+    // (MapMessage status 7) is sent every FC_ACK_EVERY_BYTES so the SRC can bound its unacked
+    // window. Sent from write-completion listeners = this channel's event loop only.
+    private long fcUnacked = 0;
+    private static final long FC_ACK_EVERY_BYTES = 1024 * 1024;
+    // per-session data-message counter for sampled hop tracing (see stunnel_trace_sample_n)
+    private long dataMsgCount = 0;
+
     public DstSessionHandler(SocketController sc, PluginBuilder pb, PerformanceMonitor pm, TunnelDemux demux) {
         this.socketController = sc;
         this.plugin = pb;
@@ -130,6 +138,14 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     p.addListener(f -> {
                         if (!f.isSuccess()) {
                             logger.warn("Write failed for ClientID: " + clientId, f.cause());
+                        } else {
+                            // ack AFTER the target socket write completes: a slow target slows
+                            // acks, which shrinks the SRC's send window — end-to-end backpressure
+                            fcUnacked += read;
+                            if (fcUnacked >= FC_ACK_EVERY_BYTES) {
+                                sendFcAck(fcUnacked);
+                                fcUnacked = 0;
+                            }
                         }
                         if (--pendingWrites == 0) {
                             maybeHalfClose(ctx);
@@ -215,7 +231,12 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             bytesMessage.setStringProperty("stunnel_id", this.stunnelId);
             bytesMessage.setStringProperty("direction", "src");
             bytesMessage.setStringProperty("client_id", this.clientId);
-            bytesMessage.setStringProperty("cresco_trace", "1");   // brokers stamp cresco_hops as it transits
+            int sampleN = socketController.getTraceSampleN();
+            if (sampleN == 1 || (sampleN > 1 && (dataMsgCount % sampleN) == 0)) {
+                bytesMessage.setStringProperty("cresco_trace", "1");   // brokers stamp cresco_hops as it transits
+            }
+            dataMsgCount++;
+            bytesMessage.setIntProperty("dp_bytes", bytesRead);        // link tx-byte accounting (LinkMetrics)
             byte[] data = new byte[bytesRead];
             in.readBytes(data);
             bytesMessage.writeBytes(data);
@@ -234,6 +255,23 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             notifySrcOfGracefulClose();
         }
         demux.discard(clientId);
+    }
+
+    /** Flow-control ack: tell the SRC these bytes reached the target socket (status 7).
+     *  An old SRC ignores unknown status codes, so this is safe to send unconditionally. */
+    private void sendFcAck(long bytes) {
+        try {
+            MapMessage ack = plugin.getAgentService().getDataPlaneService().createMapMessage();
+            ack.setStringProperty("stunnel_id", this.stunnelId);
+            ack.setStringProperty("direction", "src");
+            ack.setStringProperty("client_id", this.clientId);
+            ack.setInt("status", 7);
+            ack.setLong("fc_bytes", bytes);
+            ack.setJMSPriority(0);
+            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, ack);
+        } catch (Exception e) {
+            logger.warn("Failed to send FC ack for ClientID: " + clientId + ": " + e.getMessage());
+        }
     }
 
     private void sendEosToSrc() {

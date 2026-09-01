@@ -67,6 +67,18 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private static final long EOS_TIMEOUT_MS = 5000;
     private io.netty.util.concurrent.ScheduledFuture<?> eosTimeout;
 
+    // --- src->dst credit flow control (all touched ONLY on this channel's event loop) ---
+    // Without this, an over-capacity sender was ingested at memory speed and the over-capacity
+    // bytes died in the broker (silent TCP payload loss). The DST acks delivered bytes
+    // (MapMessage status 7 after the target socket write completes); reads pause once the
+    // unacked window exceeds fcWindow and resume at half. Pacing arms only when the first ack
+    // arrives, so a session against an old (non-acking) DST behaves exactly as before.
+    private long fcOutstanding = 0;
+    private boolean fcActive = false;
+    private boolean fcPaused = false;
+    // per-session data-message counter for sampled hop tracing (see stunnel_trace_sample_n)
+    private long dataMsgCount = 0;
+
     public SrcSessionHandler(SocketController sc, PluginBuilder pb, PerformanceMonitor pm) {
         this.socketController = sc;
         this.plugin = pb;
@@ -234,7 +246,20 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 MapMessage statusMessage = (MapMessage) msg;
                 if (statusMessage.itemExists("status")) {
                     int status = statusMessage.getInt("status");
-                    if (status == 8) {
+                    if (status == 7) {
+                        // flow-control ack from DST: fc_bytes reached the target socket
+                        if (statusMessage.itemExists("fc_bytes")) {
+                            fcActive = true;
+                            fcOutstanding -= statusMessage.getLong("fc_bytes");
+                            if (fcOutstanding < 0) fcOutstanding = 0;
+                            int fcWindow = socketController.getFcWindowBytes();
+                            if (fcPaused && (fcWindow <= 0 || fcOutstanding <= fcWindow / 2)) {
+                                fcPaused = false;
+                                ctx.channel().config().setAutoRead(true);
+                                logger.debug("FC resume for ClientID: " + clientId + " outstanding=" + fcOutstanding);
+                            }
+                        }
+                    } else if (status == 8) {
                         logger.info("Received graceful close (prepare) from DST for ClientID: " + clientId + ". Waiting for EOS and drain.");
                         this.gracefulCloseInitiatedByDst = true;
                         if (!eosSeen && eosTimeout == null) {
@@ -313,11 +338,26 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             bytesMessage.setStringProperty("stunnel_id", this.stunnelId);
             bytesMessage.setStringProperty("direction", "dst");
             bytesMessage.setStringProperty("client_id", this.clientId);
-            bytesMessage.setStringProperty("cresco_trace", "1");   // brokers stamp cresco_hops as it transits
+            int sampleN = socketController.getTraceSampleN();
+            if (sampleN == 1 || (sampleN > 1 && (dataMsgCount % sampleN) == 0)) {
+                bytesMessage.setStringProperty("cresco_trace", "1");   // brokers stamp cresco_hops as it transits
+            }
+            dataMsgCount++;
+            bytesMessage.setIntProperty("dp_bytes", bytesRead);        // link tx-byte accounting (LinkMetrics)
             byte[] data = new byte[bytesRead];
             in.readBytes(data);
             bytesMessage.writeBytes(data);
             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, bytesMessage);
+
+            // outstanding counts ALL relayed bytes so it matches the DST's cumulative acks;
+            // only the pause action waits for fcActive (first ack seen = DST speaks the protocol)
+            fcOutstanding += bytesRead;
+            int fcWindow = socketController.getFcWindowBytes();
+            if (fcActive && fcWindow > 0 && !fcPaused && fcOutstanding >= fcWindow) {
+                fcPaused = true;
+                ctx.channel().config().setAutoRead(false);
+                logger.debug("FC pause for ClientID: " + clientId + " outstanding=" + fcOutstanding);
+            }
         }
     }
 

@@ -90,6 +90,11 @@ public class SocketController {
     private final java.util.concurrent.atomic.AtomicInteger socketBufferBytes = new java.util.concurrent.atomic.AtomicInteger();
     private final java.util.concurrent.atomic.AtomicInteger readChunkBytes = new java.util.concurrent.atomic.AtomicInteger();
     private final java.util.concurrent.atomic.AtomicInteger writeHighWaterBytes = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger fcWindowBytes = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger traceSampleN = new java.util.concurrent.atomic.AtomicInteger();
+
+    public int getFcWindowBytes() { return fcWindowBytes.get(); }
+    public int getTraceSampleN() { return traceSampleN.get(); }
 
     // B-2 metrics unification: one plugin-wide MeasurementEngine exposing stunnel's live counters via
     // the standard getmetrics EXEC, so they fold into the controller's unified metric inventory.
@@ -103,8 +108,16 @@ public class SocketController {
 
         // seed the live tunables from static config (defaults preserve current behavior)
         this.socketBufferBytes.set(plugin.getConfig().getIntegerParam("stunnel_socket_buffer_bytes", 4 * 1024 * 1024));
-        this.readChunkBytes.set(plugin.getConfig().getIntegerParam("stunnel_read_chunk_bytes", 256 * 1024));
+        this.readChunkBytes.set(plugin.getConfig().getIntegerParam("stunnel_read_chunk_bytes", 1024 * 1024));
         this.writeHighWaterBytes.set(plugin.getConfig().getIntegerParam("stunnel_write_high_water_bytes", 2 * 1024 * 1024));
+        // credit window for src->dst flow control: the SRC pauses socket reads once this many
+        // relayed bytes are unacknowledged by the DST (acks = MapMessage status 7, sent after the
+        // bytes actually reach the target socket). 0 disables pacing.
+        this.fcWindowBytes.set(plugin.getConfig().getIntegerParam("stunnel_fc_window_bytes", 16 * 1024 * 1024));
+        // stamp cresco_trace (per-message broker hop tracing) on every Nth data message per
+        // session instead of every message: tracing every frame cost broker CPU on the entire
+        // data path. 1 = trace every message (old behavior), 0 = never trace data messages.
+        this.traceSampleN.set(plugin.getConfig().getIntegerParam("stunnel_trace_sample_n", 256));
         this.dstInitSlots = new java.util.concurrent.Semaphore(
                 plugin.getConfig().getIntegerParam("stunnel_dst_init_max_concurrent", 64));
         this.scheduler = Executors.newScheduledThreadPool(
@@ -430,7 +443,7 @@ public class SocketController {
                     // the socket buffers. All configurable; defaults preserve behavior on slow edges.
                     .childOption(ChannelOption.SO_RCVBUF, sockBuf)
                     .childOption(ChannelOption.SO_SNDBUF, sockBuf)
-                    .childOption(ChannelOption.RCVBUF_ALLOCATOR, new AdaptiveRecvByteBufAllocator(2048, 65536, readMax))
+                    .childOption(ChannelOption.RCVBUF_ALLOCATOR, new AdaptiveRecvByteBufAllocator(8192, 262144, readMax))
                     .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(writeHigh / 2, writeHigh));
 
             ChannelFuture f = b.bind(srcPort).sync();
@@ -635,7 +648,7 @@ public class SocketController {
                 // Match the SRC side: large reads -> large broker messages, enlarged socket buffers.
                 .option(ChannelOption.SO_RCVBUF, sockBuf)
                 .option(ChannelOption.SO_SNDBUF, sockBuf)
-                .option(ChannelOption.RCVBUF_ALLOCATOR, new AdaptiveRecvByteBufAllocator(2048, 65536, readMax))
+                .option(ChannelOption.RCVBUF_ALLOCATOR, new AdaptiveRecvByteBufAllocator(8192, 262144, readMax))
                 .option(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(writeHigh / 2, writeHigh));
 
         connectWithRetry(b, dstHost, dstPort, tunnelConfig, clientId, 3);
@@ -1039,6 +1052,8 @@ public class SocketController {
             if (tuning.containsKey("net_socket_buffer_bytes")) socketBufferBytes.set(Integer.parseInt(tuning.get("net_socket_buffer_bytes")));
             if (tuning.containsKey("net_read_chunk_bytes")) readChunkBytes.set(Integer.parseInt(tuning.get("net_read_chunk_bytes")));
             if (tuning.containsKey("net_write_high_water_bytes")) writeHighWaterBytes.set(Integer.parseInt(tuning.get("net_write_high_water_bytes")));
+            if (tuning.containsKey("net_fc_window_bytes")) fcWindowBytes.set(Integer.parseInt(tuning.get("net_fc_window_bytes")));
+            if (tuning.containsKey("net_trace_sample_n")) traceSampleN.set(Integer.parseInt(tuning.get("net_trace_sample_n")));
             logger.info("applyNetTuning: sockBuf=" + socketBufferBytes.get() + " readChunk="
                     + readChunkBytes.get() + " writeHi=" + writeHighWaterBytes.get());
         } catch (Exception ex) {
