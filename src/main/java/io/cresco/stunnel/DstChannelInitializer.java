@@ -75,8 +75,11 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     // (MapMessage status 7) is sent every FC_ACK_EVERY_BYTES so the SRC can bound its unacked
     // window. Sent from write-completion listeners = this channel's event loop only.
     private long fcUnacked = 0;
-    private static final long FC_ACK_EVERY_BYTES = SrcFlowControl.ACK_EVERY;
-    // protocol 2: ack in cost units (payload + SrcFlowControl.MSG_OVERHEAD per message), matching the SRC
+    private long fcUnackedMsgs = 0;
+    private long txSeq = 0;                                              // fc_seq on our data (protocol 2)
+    private final SrcFlowControl.Seq rxSeq = new SrcFlowControl.Seq();   // the SRC's fc_seq
+    private static final long FC_ACK_EVERY_BYTES = SrcFlowControl.ACK_EVERY_BYTES;
+    // protocol 2: ack messages too (every ACK_EVERY_MSGS), stamp fc_seq on our data and check the SRC's
     private final boolean fcCost;
     // per-session data-message counter for sampled hop tracing (see stunnel_trace_sample_n)
     private long dataMsgCount = 0;
@@ -132,6 +135,18 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     maybeHalfClose(ctx);
                     return;
                 }
+                if (fcCost && m.propertyExists("fc_seq")) {
+                    long gap = rxSeq.check(m.getLongProperty("fc_seq"));
+                    if (gap != -1) {
+                        // the dataplane dropped (or reordered) tunnel data: never serve a stream with a hole
+                        logger.error("Stream gap from SRC for ClientID: " + clientId + " on " + stunnelId + ": "
+                                + (gap > 0 ? gap + " message(s) missing" : "duplicate/out-of-order message")
+                                + " before seq " + (rxSeq.expected() - 1) + " - failing the session");
+                        notifySrcOfError(new Exception("stream gap: the dataplane lost tunnel data"));
+                        ctx.close();
+                        return;
+                    }
+                }
 
                 m.reset();
                 // Write the whole message body as ONE buffer (see SrcChannelInitializer note):
@@ -150,10 +165,12 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         } else {
                             // ack AFTER the target socket write completes: a slow target slows
                             // acks, which shrinks the SRC's send window — end-to-end backpressure
-                            fcUnacked += fcCost ? read + SrcFlowControl.MSG_OVERHEAD : read;
-                            if (fcUnacked >= FC_ACK_EVERY_BYTES) {
-                                sendFcAck(fcUnacked);
+                            fcUnacked += read;
+                            fcUnackedMsgs++;
+                            if (fcUnacked >= FC_ACK_EVERY_BYTES || (fcCost && fcUnackedMsgs >= SrcFlowControl.ACK_EVERY_MSGS)) {
+                                sendFcAck(fcUnacked, fcUnackedMsgs);
                                 fcUnacked = 0;
+                                fcUnackedMsgs = 0;
                             }
                         }
                         if (--pendingWrites == 0) {
@@ -246,6 +263,7 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             }
             dataMsgCount++;
             bytesMessage.setIntProperty("dp_bytes", bytesRead);        // link tx-byte accounting (LinkMetrics)
+            if (fcCost) bytesMessage.setLongProperty("fc_seq", txSeq++);   // gap detection at the SRC (protocol 2)
             byte[] data = new byte[bytesRead];
             in.readBytes(data);
             bytesMessage.writeBytes(data);
@@ -268,7 +286,7 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     /** Flow-control ack: tell the SRC these bytes reached the target socket (status 7).
      *  An old SRC ignores unknown status codes, so this is safe to send unconditionally. */
-    private void sendFcAck(long bytes) {
+    private void sendFcAck(long bytes, long msgs) {
         try {
             MapMessage ack = plugin.getAgentService().getDataPlaneService().createMapMessage();
             ack.setStringProperty("stunnel_id", this.stunnelId);
@@ -276,6 +294,7 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             ack.setStringProperty("client_id", this.clientId);
             ack.setInt("status", 7);
             ack.setLong("fc_bytes", bytes);
+            if (fcCost) ack.setLong("fc_msgs", msgs);
             ack.setJMSPriority(0);
             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, ack);
         } catch (Exception e) {

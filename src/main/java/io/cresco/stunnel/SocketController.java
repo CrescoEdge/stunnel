@@ -95,6 +95,9 @@ public class SocketController {
 
     public int getFcWindowBytes() { return fcWindowBytes.get(); }
     public int getReadChunkBytes() { return readChunkBytes.get(); }
+    /** Protocol-2 message window: data messages a session may have unacked (below the broker's slow-subscriber discard limit). */
+    public int getFcWindowMsgs() { return fcWindowMsgs.get(); }
+    private final java.util.concurrent.atomic.AtomicInteger fcWindowMsgs = new java.util.concurrent.atomic.AtomicInteger(SrcFlowControl.DEFAULT_WINDOW_MSGS);
     public int getTraceSampleN() { return traceSampleN.get(); }
 
     // B-2 metrics unification: one plugin-wide MeasurementEngine exposing stunnel's live counters via
@@ -115,6 +118,7 @@ public class SocketController {
         // relayed bytes are unacknowledged by the DST (acks = MapMessage status 7, sent after the
         // bytes actually reach the target socket). 0 disables pacing.
         this.fcWindowBytes.set(plugin.getConfig().getIntegerParam("stunnel_fc_window_bytes", 16 * 1024 * 1024));
+        this.fcWindowMsgs.set(plugin.getConfig().getIntegerParam("stunnel_fc_window_msgs", SrcFlowControl.DEFAULT_WINDOW_MSGS));
         // stamp cresco_trace (per-message broker hop tracing) on every Nth data message per
         // session instead of every message: tracing every frame cost broker CPU on the entire
         // data path. 1 = trace every message (old behavior), 0 = never trace data messages.
@@ -605,7 +609,7 @@ public class SocketController {
         return createDstSession(stunnelId, clientId, false);
     }
 
-    /** @param fcCost the SRC speaks flow-control protocol 2: ack in cost units (payload + per-message overhead) */
+    /** @param fcCost the SRC speaks flow-control protocol 2: ack messages as well as bytes, stamp and check fc_seq */
     public boolean createDstSession(String stunnelId, String clientId, boolean fcCost) {
         Map<String, String> tunnelConfig = activeTunnelsConfig.get(stunnelId);
         if (tunnelConfig == null) {

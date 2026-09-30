@@ -75,6 +75,17 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     // arrives, so a session against an old (non-acking) DST behaves exactly as before.
     // Protocol 2 (see SrcFlowControl): paced from the first byte to the DST's pre-registration budget.
     private final SrcFlowControl fc = new SrcFlowControl();
+    private long txSeq = 0;                                      // fc_seq stamped on our data messages
+    private final SrcFlowControl.Seq rxSeq = new SrcFlowControl.Seq();   // the DST's fc_seq on its data
+
+    private static long longParam(MsgEvent m, String k) {
+        try {
+            String v = m.getParam(k);
+            return v == null ? 0 : Long.parseLong(v.trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
     // per-session data-message counter for sampled hop tracing (see stunnel_trace_sample_n)
     private long dataMsgCount = 0;
 
@@ -159,14 +170,12 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     return;
                 }
                 if (response != null && "10".equals(response.getParam("status"))) {
-                    long budget = 0;
-                    try {
-                        String b = response.getParam("fc_prereg_bytes");
-                        if (b != null) budget = Long.parseLong(b.trim());
-                    } catch (NumberFormatException ignore) { }
-                    long preAck = fc.negotiate(budget, socketController.getReadChunkBytes(), socketController.getFcWindowBytes());
+                    long budgetBytes = longParam(response, "fc_prereg_bytes"), budgetMsgs = longParam(response, "fc_prereg_msgs");
+                    boolean paced = fc.negotiate(budgetBytes, budgetMsgs, socketController.getReadChunkBytes(),
+                            socketController.getFcWindowBytes(), socketController.getFcWindowMsgs());
                     logger.info("DST session initiation request successful for ClientID: " + clientId
-                            + (budget > 0 ? " (fc protocol 2: DST budget " + budget + ", paced from the first byte at " + preAck + ")"
+                            + (fc.proto2() ? " (fc protocol 2: DST budget " + budgetMsgs + " msgs / " + budgetBytes + " B"
+                                    + (paced ? ", paced from the first byte)" : ", budget too small: paced from the first ack)")
                                           : " (DST without fc protocol 2: unpaced until its first ack)"));
                     ctx.channel().config().setAutoRead(true);
                 } else {
@@ -219,6 +228,17 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 if (m.propertyExists("cresco_hops")) performanceMonitor.setHops(m.getStringProperty("cresco_hops"));
                 boolean eos = m.propertyExists("eos") && m.getBooleanProperty("eos");
 
+                if (!eos && m.propertyExists("fc_seq")) {   // only a protocol-2 DST stamps its data
+                    long gap = rxSeq.check(m.getLongProperty("fc_seq"));
+                    if (gap != -1) {
+                        logger.error("Stream gap from DST for ClientID: " + clientId + " on " + stunnelId + ": "
+                                + (gap > 0 ? gap + " message(s) missing" : "duplicate/out-of-order message")
+                                + " before seq " + (rxSeq.expected() - 1) + " - failing the session");
+                        sendFailureToDst("stream gap: the dataplane lost tunnel data");
+                        ctx.close();
+                        return;
+                    }
+                }
                 if (eos) {
                     logger.info("EOS marker received from DST for ClientID: " + clientId);
                     eosSeen = true;
@@ -257,9 +277,10 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     if (status == 7) {
                         // flow-control ack from DST: fc_bytes reached the target socket
                         if (statusMessage.itemExists("fc_bytes")) {
-                            if (fc.onAck(statusMessage.getLong("fc_bytes"), socketController.getFcWindowBytes())) {
+                            long ackMsgs = statusMessage.itemExists("fc_msgs") ? statusMessage.getLong("fc_msgs") : 0;
+                            if (fc.onAck(statusMessage.getLong("fc_bytes"), ackMsgs, socketController.getFcWindowBytes(), socketController.getFcWindowMsgs())) {
                                 ctx.channel().config().setAutoRead(true);
-                                logger.debug("FC resume for ClientID: " + clientId + " outstanding=" + fc.outstanding());
+                                logger.debug("FC resume for ClientID: " + clientId + " outstanding=" + fc.outstandingBytes() + " B / " + fc.outstandingMsgs() + " msgs");
                             }
                         }
                     } else if (status == 8) {
@@ -347,15 +368,16 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             }
             dataMsgCount++;
             bytesMessage.setIntProperty("dp_bytes", bytesRead);        // link tx-byte accounting (LinkMetrics)
+            bytesMessage.setLongProperty("fc_seq", txSeq++);            // gap detection at the DST (protocol 2)
             byte[] data = new byte[bytesRead];
             in.readBytes(data);
             bytesMessage.writeBytes(data);
             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, bytesMessage);
 
-            // outstanding counts ALL relayed messages, in the units the DST acks (SrcFlowControl)
-            if (fc.onSent(bytesRead, socketController.getFcWindowBytes())) {
+            // outstanding counts ALL relayed bytes and messages, as the DST acks them (SrcFlowControl)
+            if (fc.onSent(bytesRead, socketController.getFcWindowBytes(), socketController.getFcWindowMsgs())) {
                 ctx.channel().config().setAutoRead(false);
-                logger.debug("FC pause for ClientID: " + clientId + " outstanding=" + fc.outstanding());
+                logger.debug("FC pause for ClientID: " + clientId + " outstanding=" + fc.outstandingBytes() + " B / " + fc.outstandingMsgs() + " msgs");
             }
         }
     }

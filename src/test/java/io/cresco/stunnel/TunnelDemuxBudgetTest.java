@@ -13,6 +13,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * The DST's pre-registration buffer (TunnelDemux) and the SRC's pacing (SrcFlowControl), without JMS or
@@ -59,96 +60,126 @@ class TunnelDemuxBudgetTest {
     }
 
     @Test
-    void theOldCountCapFailedAFastSenderBeforeTheTargetConnected() {
-        // The pre-fix configuration: 256 messages, sender unpaced until the first ack. 4 KiB writes before
-        // the target connects (the speed suite's 4 KiB stunnel cell under load) = 300 messages, ~1.2 MB.
-        TunnelDemux d = demux(Long.MAX_VALUE, 256);
+    void anUnpacedSenderOverflowsTheBufferBeforeTheTargetConnects() {
+        // The defect: the sender was unpaced until the first ack, which comes only after the DST's target
+        // connects. 4 KiB writes before a slow connect (the speed suite's 4 KiB stunnel cell under load):
+        // 300 messages, ~1.2 MB, past the 256-message buffer -> the session was failed.
+        TunnelDemux d = demux(TunnelDemux.DEFAULT_BUFFER_BYTES, 256);
         d.expect(CLIENT);
         for (int i = 0; i < 300; i++) d.dispatch(data(CLIENT, 4096, i));
-        assertFalse(d.register(CLIENT, m -> { }), "256-message cap must have failed the session");
+        assertFalse(d.register(CLIENT, m -> { }), "256-message buffer must have failed the session");
         assertEquals(1, d.overflows());
+        assertEquals(1, log.errors.size(), "loud, once");
         assertTrue(log.errors.get(0).contains("over budget"), log.errors.toString());
     }
 
     @Test
-    void theByteBudgetHoldsThatBurstAndDeliversItInOrder() {
-        TunnelDemux d = demux(TunnelDemux.DEFAULT_BUFFER_BYTES, 0);
+    void theByteBudgetBindsLargeMessagesToo() {
+        TunnelDemux d = demux(4L * 1024 * 1024, 256);
         d.expect(CLIENT);
-        for (int i = 0; i < 300; i++) d.dispatch(data(CLIENT, 4096, i));
-        List<Integer> got = new ArrayList<>();
-        assertTrue(d.register(CLIENT, m -> got.add(seq(m))));
-        assertEquals(300, got.size());
-        for (int i = 0; i < 300; i++) assertEquals(i, got.get(i));
-        assertEquals(0, d.overflows());
-        // live after registration
-        d.dispatch(data(CLIENT, 4096, 300));
-        assertEquals(301, got.size());
+        for (int i = 0; i < 5; i++) d.dispatch(data(CLIENT, 1024 * 1024, i));   // 5 MiB > 4 MiB
+        assertEquals(1, d.overflows());
+        assertFalse(d.register(CLIENT, m -> { }), "an over-budget session must be failed, never served truncated");
     }
 
     @Test
-    void anUnpacedSenderPastTheBudgetFailsLoudlyNotSilently() {
-        TunnelDemux d = demux(4L * 1024 * 1024, 0);
+    void bufferedMessagesAreDeliveredInOrderThenLive() {
+        TunnelDemux d = demux(TunnelDemux.DEFAULT_BUFFER_BYTES, 256);
         d.expect(CLIENT);
-        for (int i = 0; i < 5; i++) d.dispatch(data(CLIENT, 1024 * 1024, i));   // 5 MiB + overhead > 4 MiB
-        assertEquals(1, d.overflows());
-        assertEquals(1, log.errors.size());
-        assertTrue(log.errors.get(0).contains("budget"), log.errors.toString());
-        assertFalse(d.register(CLIENT, m -> { }), "an over-budget session must be failed, never served truncated");
+        for (int i = 0; i < 200; i++) d.dispatch(data(CLIENT, 4096, i));
+        List<Integer> got = new ArrayList<>();
+        assertTrue(d.register(CLIENT, m -> got.add(seq(m))));
+        d.dispatch(data(CLIENT, 4096, 200));
+        assertEquals(201, got.size());
+        for (int i = 0; i <= 200; i++) assertEquals(i, got.get(i));
+        assertEquals(0, d.overflows());
     }
 
     /**
      * End to end: a protocol-2 SRC paced to the DST's advertised budget never overflows it, however long the
-     * target connect takes, and resumes once the DST registers and acks.
+     * target connect takes, keeps at most the message window in flight afterwards (the broker's slow-subscriber
+     * discard limit is ~350 per consumer), and never stalls.
      */
     @Test
-    void aProtocol2SenderPacedToTheAdvertisedBudgetNeverOverflows() {
+    void aProtocol2SenderNeverOverflowsNeverExceedsTheMessageWindowAndNeverStalls() {
+        long window = 16L * 1024 * 1024, readMax = 1024 * 1024;
+        int windowMsgs = SrcFlowControl.DEFAULT_WINDOW_MSGS;
         for (int chunk : new int[]{1, 4096, 65536, 1024 * 1024}) {
-            TunnelDemux d = demux(TunnelDemux.DEFAULT_BUFFER_BYTES, 0);
+            TunnelDemux d = demux(TunnelDemux.DEFAULT_BUFFER_BYTES, 256);
             SrcFlowControl fc = new SrcFlowControl();
-            long window = 16L * 1024 * 1024, readMax = 1024 * 1024;
-            long preAck = fc.negotiate(d.bufferBudgetBytes(), readMax, window);
-            assertTrue(preAck >= SrcFlowControl.MIN_PREACK && preAck <= d.bufferBudgetBytes() - readMax, "preAck " + preAck);
+            assertTrue(fc.negotiate(d.bufferBudgetBytes(), d.bufferBudgetMsgs(), readMax, window, windowMsgs));
             d.expect(CLIENT);
-            // the target connect is "slow": the sender writes until its flow control pauses it
+            // phase 1: the target connect is slow; the sender writes until its flow control pauses it
             int sent = 0;
-            boolean paused = false;
-            while (!paused && sent < 50_000_000) {
+            while (!fc.paused() && sent < 10_000_000) {
                 d.dispatch(data(CLIENT, chunk, sent));
-                paused = fc.onSent(chunk, window);
+                fc.onSent(chunk, window, windowMsgs);
                 sent++;
             }
-            assertTrue(paused, "chunk " + chunk + ": sender never paused");
+            assertTrue(fc.paused(), "chunk " + chunk + ": sender never paused");
             assertEquals(0, d.overflows(), "chunk " + chunk + ": buffer overflowed: " + log.errors);
-            // target connects: the demux drains, the DST acks in cost units every ACK_EVERY
-            long[] unacked = {0};
-            List<Long> acks = new ArrayList<>();
+            // phase 2: the target connects; the DST writes and acks (bytes + messages, every ACK_EVERY_*),
+            // the sender resumes and streams on. Model the wire as a FIFO the DST drains one message at a time.
+            java.util.ArrayDeque<Integer> wire = new java.util.ArrayDeque<>();
+            long[] ub = {0}, um = {0};
+            List<long[]> acks = new ArrayList<>();
             MessageListener dst = m -> {
-                unacked[0] += TunnelDemux.cost(m);
-                if (unacked[0] >= SrcFlowControl.ACK_EVERY) { acks.add(unacked[0]); unacked[0] = 0; }
+                ub[0] += TunnelDemux.payload(m);
+                um[0]++;
+                if (ub[0] >= SrcFlowControl.ACK_EVERY_BYTES || um[0] >= SrcFlowControl.ACK_EVERY_MSGS) {
+                    acks.add(new long[]{ub[0], um[0]});
+                    ub[0] = 0; um[0] = 0;
+                }
             };
             assertTrue(d.register(CLIENT, dst));
-            boolean resumed = false;
-            for (long a : acks) resumed |= fc.onAck(a, window);
-            assertTrue(resumed, "chunk " + chunk + ": sender never resumed (outstanding " + fc.outstanding() + ")");
-            assertTrue(fc.outstanding() < SrcFlowControl.ACK_EVERY, "chunk " + chunk + ": outstanding " + fc.outstanding());
+            long maxInFlight = 0;
+            int steps = 0;
+            while (steps++ < 200_000) {
+                for (long[] a : acks) fc.onAck(a[0], a[1], window, windowMsgs);
+                acks.clear();
+                if (!fc.paused()) {
+                    d.dispatch(data(CLIENT, chunk, sent));      // registered: goes straight to the DST
+                    fc.onSent(chunk, window, windowMsgs);
+                    sent++;
+                    maxInFlight = Math.max(maxInFlight, fc.outstandingMsgs());
+                } else if (acks.isEmpty() && ub[0] == 0 && um[0] == 0) {
+                    break;
+                } else if (acks.isEmpty()) {
+                    fail("chunk " + chunk + ": stalled with " + fc.outstandingMsgs() + " msgs / " + fc.outstandingBytes() + " B unacked");
+                }
+                if (sent > 2000 && !fc.paused()) break;
+            }
+            assertTrue(maxInFlight <= windowMsgs, "chunk " + chunk + ": " + maxInFlight + " messages in flight");
+            assertTrue(sent > 2000, "chunk " + chunk + ": only " + sent + " messages went through");
         }
     }
 
     @Test
     void anOldDstKeepsTheOldBehaviour() {
         SrcFlowControl fc = new SrcFlowControl();
-        assertEquals(0, fc.negotiate(0, 1024 * 1024, 16L * 1024 * 1024));
-        assertFalse(fc.costMode());
+        assertFalse(fc.negotiate(0, 0, 1024 * 1024, 16L * 1024 * 1024, 128));
+        assertFalse(fc.proto2());
         long window = 16L * 1024 * 1024;
-        for (int i = 0; i < 100; i++) assertFalse(fc.onSent(1024 * 1024, window), "no pacing before the first ack");
-        assertFalse(fc.onAck(1024 * 1024, window));                // first ack arms the window; still over it
-        assertTrue(fc.onSent(1, window));                          // now paced
-        assertTrue(fc.onAck(fc.outstanding(), window));            // drained: resume
+        for (int i = 0; i < 1000; i++) assertFalse(fc.onSent(4096, window, 128), "no pacing before the first ack, no message window");
+        assertFalse(fc.onAck(1024 * 1024, 0, window, 128));
+        for (int i = 0; i < 4000; i++) fc.onSent(4096, window, 128);
+        assertTrue(fc.paused(), "byte window after the first ack");
+        assertTrue(fc.onAck(fc.outstandingBytes(), 0, window, 128));
     }
 
     @Test
-    void aBudgetTooSmallToAckAgainstIsNotUsed() {
+    void aBudgetTooSmallToAckAgainstIsNotUsedBeforeTheFirstAck() {
         SrcFlowControl fc = new SrcFlowControl();
-        assertEquals(0, fc.negotiate(2L * 1024 * 1024, 1024 * 1024, 16L * 1024 * 1024));   // would stall below 2 x ACK_EVERY
+        assertFalse(fc.negotiate(24L << 20, 16, 1024 * 1024, 16L << 20, 128));      // 15 msgs < 2 x ACK_EVERY_MSGS
+        assertFalse(fc.negotiate(2L << 20, 256, 1024 * 1024, 16L << 20, 128));     // 1 MiB < 2 x ACK_EVERY_BYTES
+    }
+
+    @Test
+    void aStreamGapIsDetected() {
+        SrcFlowControl.Seq s = new SrcFlowControl.Seq();
+        for (int i = 0; i < 10; i++) assertEquals(-1, s.check(i));
+        assertEquals(3, s.check(13));      // 10, 11, 12 dropped by the dataplane
+        assertEquals(-1, s.check(14));
+        assertTrue(s.check(14) < -1);      // duplicate
     }
 }

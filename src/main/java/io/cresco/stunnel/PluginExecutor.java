@@ -276,6 +276,7 @@ public class PluginExecutor implements Executor {
                         TunnelDemux d = socketController.getDstDemux(stunnelId);
                         if (fcCost && d != null) {
                             incoming.setParam("fc_prereg_bytes", String.valueOf(d.bufferBudgetBytes()));
+                            incoming.setParam("fc_prereg_msgs", String.valueOf(d.bufferBudgetMsgs()));
                         }
                         incoming.setParam("status", "10");
                         incoming.setParam("status_desc", "DST session connection attempt initiated.");
