@@ -94,6 +94,7 @@ public class SocketController {
     private final java.util.concurrent.atomic.AtomicInteger traceSampleN = new java.util.concurrent.atomic.AtomicInteger();
 
     public int getFcWindowBytes() { return fcWindowBytes.get(); }
+    public int getReadChunkBytes() { return readChunkBytes.get(); }
     public int getTraceSampleN() { return traceSampleN.get(); }
 
     // B-2 metrics unification: one plugin-wide MeasurementEngine exposing stunnel's live counters via
@@ -601,6 +602,11 @@ public class SocketController {
     }
 
     public boolean createDstSession(String stunnelId, String clientId) {
+        return createDstSession(stunnelId, clientId, false);
+    }
+
+    /** @param fcCost the SRC speaks flow-control protocol 2: ack in cost units (payload + per-message overhead) */
+    public boolean createDstSession(String stunnelId, String clientId, boolean fcCost) {
         Map<String, String> tunnelConfig = activeTunnelsConfig.get(stunnelId);
         if (tunnelConfig == null) {
             logger.error("Cannot create DST session for client " + clientId + ": Tunnel config not found for stunnel_id " + stunnelId);
@@ -641,7 +647,7 @@ public class SocketController {
         Bootstrap b = new Bootstrap();
         b.group(workerGroup)
                 .channel(NioSocketChannel.class)
-                .handler(new DstChannelInitializer(this, plugin, tunnelConfig, clientId, pm, demux))
+                .handler(new DstChannelInitializer(this, plugin, tunnelConfig, clientId, pm, demux, fcCost))
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)

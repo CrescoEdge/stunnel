@@ -27,6 +27,15 @@ import java.util.concurrent.ConcurrentHashMap;
  * same lock that {@code dispatch} uses to decide buffer-vs-deliver, and delivery happens OUTSIDE
  * that lock. Messages for a client that was never announced via {@link #expect} are dropped, so a
  * late or stray delivery cannot grow the buffer map without bound.
+ *
+ * <p><b>Pre-registration budget.</b> A client's messages are held from {@link #expect} until its
+ * {@link #register} within a budget of {@code stunnel_demux_buffer_bytes} (default 24 MiB), counted as
+ * payload plus {@link SrcFlowControl#MSG_OVERHEAD} per message so it bounds the message count too. The
+ * budget is what this node advertises to a protocol-2 SRC ({@code fc_prereg_bytes}), which then paces
+ * from its first byte and cannot exceed it: the buffer is backpressured end to end instead of dropping.
+ * It used to be 256 messages with an unpaced sender, and a fast client outran a slow target connect
+ * (4 KiB writes: ~1-2 MB) and was failed. Exceeding the budget (an old, unpaced SRC) still fails the
+ * session, loudly: an ERROR with the counts, and {@link #overflows()}.
  */
 public class TunnelDemux {
 
@@ -34,23 +43,52 @@ public class TunnelDemux {
     private final CLogger logger;
     private final String stunnelId;
     private final String direction;
-    private final int maxBufferedPerClient;
+    private final int maxBufferedPerClient;     // message-count cap, 0 = none (the byte budget governs)
+    private final long maxBufferedBytes;        // per-client pre-registration budget, cost units
 
     private final Map<String, MessageListener> handlers = new ConcurrentHashMap<>();
     private final Map<String, List<Message>> pending = new ConcurrentHashMap<>();
     private final Map<String, Boolean> overflowed = new ConcurrentHashMap<>();
+    private final Map<String, long[]> pendingCost = new ConcurrentHashMap<>();   // guarded by lock
+    private final java.util.concurrent.atomic.AtomicLong overflows = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.Set<String> draining = new java.util.HashSet<>();   // guarded by lock
     private final Object lock = new Object();   // guards the buffer/handler handoff ONLY
 
     private volatile String jmsListenerId;
     private volatile boolean closed;
 
+    public static final long DEFAULT_BUFFER_BYTES = 24L * 1024 * 1024;
+
     public TunnelDemux(PluginBuilder plugin, String stunnelId, String direction) {
+        this(plugin, plugin.getLogger(TunnelDemux.class.getName(), CLogger.Level.Info), stunnelId, direction,
+                plugin.getConfig().getLongParam("stunnel_demux_buffer_bytes", DEFAULT_BUFFER_BYTES),
+                plugin.getConfig().getIntegerParam("stunnel_demux_buffer_max", 0));
+    }
+
+    /** Buffering core without a dataplane (open/close need the plugin; tests pass null). */
+    TunnelDemux(PluginBuilder plugin, CLogger logger, String stunnelId, String direction, long maxBufferedBytes, int maxBufferedPerClient) {
         this.plugin = plugin;
-        this.logger = plugin.getLogger(getClass().getName(), CLogger.Level.Info);
+        this.logger = logger;
         this.stunnelId = stunnelId;
         this.direction = direction;
-        this.maxBufferedPerClient = plugin.getConfig().getIntegerParam("stunnel_demux_buffer_max", 256);
+        this.maxBufferedBytes = maxBufferedBytes > 0 ? maxBufferedBytes : DEFAULT_BUFFER_BYTES;
+        this.maxBufferedPerClient = Math.max(0, maxBufferedPerClient);
+    }
+
+    /** The per-client pre-registration budget in cost units (advertised to protocol-2 SRCs). */
+    public long bufferBudgetBytes() { return maxBufferedBytes; }
+
+    /** Sessions failed because their pre-registration buffer went over budget. */
+    public long overflows() { return overflows.get(); }
+
+    /** A message's cost against the budget: payload + {@link SrcFlowControl#MSG_OVERHEAD}. */
+    static long cost(Message m) {
+        long payload = 0;
+        try {
+            if (m.propertyExists("dp_bytes")) payload = m.getIntProperty("dp_bytes");
+            else if (m instanceof jakarta.jms.BytesMessage) payload = ((jakarta.jms.BytesMessage) m).getBodyLength();
+        } catch (Exception ignore) { }
+        return Math.max(0, payload) + SrcFlowControl.MSG_OVERHEAD;
     }
 
     /** Subscribe the tunnel's single consumer. Called once per tunnel, never per session. */
@@ -85,7 +123,7 @@ public class TunnelDemux {
         logger.info("Tunnel demux open: stunnel_id=" + stunnelId + " direction=" + direction);
     }
 
-    private void dispatch(Message msg) {
+    void dispatch(Message msg) {
         if (closed) return;
         String clientId;
         try {
@@ -109,14 +147,21 @@ public class TunnelDemux {
                     logger.debug("demux: dropping message for unknown client " + clientId + " on " + stunnelId);
                     return;
                 }
-                if (buf.size() >= maxBufferedPerClient) {
-                    if (overflowed.putIfAbsent(clientId, Boolean.TRUE) == null) {
-                        buf.clear();
-                        logger.error("demux: pre-registration buffer exceeded " + maxBufferedPerClient
-                                + " messages for client " + clientId + " on " + stunnelId + " - failing session");
-                    }
+                if (overflowed.containsKey(clientId)) return;   // already failed; register() reports it
+                long[] used = pendingCost.computeIfAbsent(clientId, k -> new long[1]);
+                long c = cost(msg);
+                if (used[0] + c > maxBufferedBytes || (maxBufferedPerClient > 0 && buf.size() >= maxBufferedPerClient)) {
+                    overflowed.put(clientId, Boolean.TRUE);
+                    overflows.incrementAndGet();
+                    logger.error("demux: pre-registration buffer over budget for client " + clientId + " on " + stunnelId
+                            + " (" + direction + "): " + buf.size() + " messages / " + used[0] + " of " + maxBufferedBytes
+                            + " budget bytes held, next message " + c + " - failing session (the sender did not pace to this"
+                            + " node's fc_prereg_bytes; an old SRC?)");
+                    buf.clear();
+                    used[0] = 0;
                     return;
                 }
+                used[0] += c;
                 buf.add(msg);
                 return;
             }
@@ -130,6 +175,7 @@ public class TunnelDemux {
     public void expect(String clientId) {
         synchronized (lock) {
             pending.putIfAbsent(clientId, new ArrayList<>());
+            pendingCost.put(clientId, new long[1]);
             overflowed.remove(clientId);
         }
     }
@@ -157,11 +203,14 @@ public class TunnelDemux {
                     List<Message> buf = pending.get(clientId);
                     if (buf == null || buf.isEmpty()) {
                         pending.remove(clientId);
+                        pendingCost.remove(clientId);
                         draining.remove(clientId);
                         return true;
                     }
                     batch = new ArrayList<>(buf);
                     buf.clear();
+                    long[] used = pendingCost.get(clientId);
+                    if (used != null) used[0] = 0;
                 }
                 for (Message m : batch) {
                     handler.onMessage(m);
@@ -180,6 +229,7 @@ public class TunnelDemux {
         synchronized (lock) {
             handlers.remove(clientId);
             pending.remove(clientId);
+            pendingCost.remove(clientId);
             overflowed.remove(clientId);
             draining.remove(clientId);
         }
@@ -197,6 +247,7 @@ public class TunnelDemux {
             closed = true;
             handlers.clear();
             pending.clear();
+            pendingCost.clear();
             overflowed.clear();
             draining.clear();
             id = jmsListenerId;

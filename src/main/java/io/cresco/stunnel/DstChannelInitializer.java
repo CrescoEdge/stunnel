@@ -25,8 +25,14 @@ public class DstChannelInitializer extends ChannelInitializer<SocketChannel> {
     private final String clientId;
     private final PerformanceMonitor performanceMonitor;
     private final TunnelDemux demux;
+    private final boolean fcCost;
 
     public DstChannelInitializer(SocketController sc, PluginBuilder pb, Map<String, String> tc, String clientId, PerformanceMonitor pm, TunnelDemux demux) {
+        this(sc, pb, tc, clientId, pm, demux, false);
+    }
+
+    public DstChannelInitializer(SocketController sc, PluginBuilder pb, Map<String, String> tc, String clientId, PerformanceMonitor pm, TunnelDemux demux, boolean fcCost) {
+        this.fcCost = fcCost;
         this.socketController = sc;
         this.plugin = pb;
         this.tunnelConfig = tc;
@@ -42,7 +48,7 @@ public class DstChannelInitializer extends ChannelInitializer<SocketChannel> {
         ch.config().setAllowHalfClosure(true);
         ch.attr(SrcChannelInitializer.CLIENT_ID_KEY).set(clientId);
         ch.attr(SrcChannelInitializer.STUNNEL_ID_KEY).set(stunnelId);
-        p.addLast(new DstSessionHandler(socketController, plugin, performanceMonitor, demux));
+        p.addLast(new DstSessionHandler(socketController, plugin, performanceMonitor, demux, fcCost));
     }
 }
 
@@ -69,11 +75,14 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     // (MapMessage status 7) is sent every FC_ACK_EVERY_BYTES so the SRC can bound its unacked
     // window. Sent from write-completion listeners = this channel's event loop only.
     private long fcUnacked = 0;
-    private static final long FC_ACK_EVERY_BYTES = 1024 * 1024;
+    private static final long FC_ACK_EVERY_BYTES = SrcFlowControl.ACK_EVERY;
+    // protocol 2: ack in cost units (payload + SrcFlowControl.MSG_OVERHEAD per message), matching the SRC
+    private final boolean fcCost;
     // per-session data-message counter for sampled hop tracing (see stunnel_trace_sample_n)
     private long dataMsgCount = 0;
 
-    public DstSessionHandler(SocketController sc, PluginBuilder pb, PerformanceMonitor pm, TunnelDemux demux) {
+    public DstSessionHandler(SocketController sc, PluginBuilder pb, PerformanceMonitor pm, TunnelDemux demux, boolean fcCost) {
+        this.fcCost = fcCost;
         this.socketController = sc;
         this.plugin = pb;
         this.performanceMonitor = pm;
@@ -141,7 +150,7 @@ class DstSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                         } else {
                             // ack AFTER the target socket write completes: a slow target slows
                             // acks, which shrinks the SRC's send window — end-to-end backpressure
-                            fcUnacked += read;
+                            fcUnacked += fcCost ? read + SrcFlowControl.MSG_OVERHEAD : read;
                             if (fcUnacked >= FC_ACK_EVERY_BYTES) {
                                 sendFcAck(fcUnacked);
                                 fcUnacked = 0;

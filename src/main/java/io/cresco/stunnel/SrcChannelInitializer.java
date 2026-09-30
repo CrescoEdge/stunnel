@@ -73,9 +73,8 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
     // (MapMessage status 7 after the target socket write completes); reads pause once the
     // unacked window exceeds fcWindow and resume at half. Pacing arms only when the first ack
     // arrives, so a session against an old (non-acking) DST behaves exactly as before.
-    private long fcOutstanding = 0;
-    private boolean fcActive = false;
-    private boolean fcPaused = false;
+    // Protocol 2 (see SrcFlowControl): paced from the first byte to the DST's pre-registration budget.
+    private final SrcFlowControl fc = new SrcFlowControl();
     // per-session data-message counter for sampled hop tracing (see stunnel_trace_sample_n)
     private long dataMsgCount = 0;
 
@@ -147,6 +146,7 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             Map<String, String> sessionConfig = new java.util.HashMap<>();
             sessionConfig.put("stunnel_id", stunnelId);
             sessionConfig.put("client_id", clientId);
+            sessionConfig.put("fc", SrcFlowControl.PROTOCOL);   // ask for pre-registration pacing
             Gson gson = new Gson();
             request.setParam("action_session_config", gson.toJson(sessionConfig));
             MsgEvent response = plugin.sendRPC(request, socketController.getDstInitTimeoutMs());
@@ -159,7 +159,15 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     return;
                 }
                 if (response != null && "10".equals(response.getParam("status"))) {
-                    logger.info("DST session initiation request successful for ClientID: " + clientId);
+                    long budget = 0;
+                    try {
+                        String b = response.getParam("fc_prereg_bytes");
+                        if (b != null) budget = Long.parseLong(b.trim());
+                    } catch (NumberFormatException ignore) { }
+                    long preAck = fc.negotiate(budget, socketController.getReadChunkBytes(), socketController.getFcWindowBytes());
+                    logger.info("DST session initiation request successful for ClientID: " + clientId
+                            + (budget > 0 ? " (fc protocol 2: DST budget " + budget + ", paced from the first byte at " + preAck + ")"
+                                          : " (DST without fc protocol 2: unpaced until its first ack)"));
                     ctx.channel().config().setAutoRead(true);
                 } else {
                     logger.error("Failed to initiate DST session for ClientID: " + clientId + ". Closing SRC connection. Response: "
@@ -249,14 +257,9 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     if (status == 7) {
                         // flow-control ack from DST: fc_bytes reached the target socket
                         if (statusMessage.itemExists("fc_bytes")) {
-                            fcActive = true;
-                            fcOutstanding -= statusMessage.getLong("fc_bytes");
-                            if (fcOutstanding < 0) fcOutstanding = 0;
-                            int fcWindow = socketController.getFcWindowBytes();
-                            if (fcPaused && (fcWindow <= 0 || fcOutstanding <= fcWindow / 2)) {
-                                fcPaused = false;
+                            if (fc.onAck(statusMessage.getLong("fc_bytes"), socketController.getFcWindowBytes())) {
                                 ctx.channel().config().setAutoRead(true);
-                                logger.debug("FC resume for ClientID: " + clientId + " outstanding=" + fcOutstanding);
+                                logger.debug("FC resume for ClientID: " + clientId + " outstanding=" + fc.outstanding());
                             }
                         }
                     } else if (status == 8) {
@@ -349,14 +352,10 @@ class SrcSessionHandler extends SimpleChannelInboundHandler<ByteBuf> {
             bytesMessage.writeBytes(data);
             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL, bytesMessage);
 
-            // outstanding counts ALL relayed bytes so it matches the DST's cumulative acks;
-            // only the pause action waits for fcActive (first ack seen = DST speaks the protocol)
-            fcOutstanding += bytesRead;
-            int fcWindow = socketController.getFcWindowBytes();
-            if (fcActive && fcWindow > 0 && !fcPaused && fcOutstanding >= fcWindow) {
-                fcPaused = true;
+            // outstanding counts ALL relayed messages, in the units the DST acks (SrcFlowControl)
+            if (fc.onSent(bytesRead, socketController.getFcWindowBytes())) {
                 ctx.channel().config().setAutoRead(false);
-                logger.debug("FC pause for ClientID: " + clientId + " outstanding=" + fcOutstanding);
+                logger.debug("FC pause for ClientID: " + clientId + " outstanding=" + fc.outstanding());
             }
         }
     }

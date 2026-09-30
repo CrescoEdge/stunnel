@@ -268,9 +268,15 @@ public class PluginExecutor implements Executor {
                 String clientId = sessionConfig.get("client_id");
 
                 if (stunnelId != null && clientId != null) {
-                    boolean attemptStarted = socketController.createDstSession(stunnelId, clientId);
+                    // protocol 2: the SRC paces to our pre-registration budget from its first byte
+                    boolean fcCost = SrcFlowControl.PROTOCOL.equals(sessionConfig.get("fc"));
+                    boolean attemptStarted = socketController.createDstSession(stunnelId, clientId, fcCost);
 
                     if (attemptStarted) {
+                        TunnelDemux d = socketController.getDstDemux(stunnelId);
+                        if (fcCost && d != null) {
+                            incoming.setParam("fc_prereg_bytes", String.valueOf(d.bufferBudgetBytes()));
+                        }
                         incoming.setParam("status", "10");
                         incoming.setParam("status_desc", "DST session connection attempt initiated.");
                     } else {
